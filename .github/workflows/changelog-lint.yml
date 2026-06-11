@@ -1,0 +1,63 @@
+name: Changelog Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changelog format
+        run: |
+          python3 - <<'EOF'
+          import re, sys, glob
+
+          errors = []
+          files = glob.glob("CHANGELOG_v*.md")
+
+          if not files:
+              print("No changelog files found — skipping")
+              sys.exit(0)
+
+          for path in files:
+              with open(path, encoding="utf-8") as f:
+                  lines = f.readlines()
+
+              in_section = False
+              prev_was_bullet = False
+
+              for i, raw in enumerate(lines, 1):
+                  line = raw.rstrip("\n")
+
+                  if line.startswith("## "):
+                      in_section = True
+                      prev_was_bullet = False
+                      continue
+
+                  if not in_section:
+                      continue
+
+                  if line == "":
+                      if prev_was_bullet:
+                          errors.append(f"{path}:{i}: blank line between entries (not allowed)")
+                      prev_was_bullet = False
+                      continue
+
+                  if line.startswith("- "):
+                      # Must match:  - **Title** — Description
+                      if not re.match(r'^- \*\*[^*]+\*\* — .+', line):
+                          errors.append(f"{path}:{i}: expected '- **Title** — Description', got: {line}")
+                      prev_was_bullet = True
+                  else:
+                      prev_was_bullet = False
+
+          if errors:
+              for e in errors:
+                  print(e)
+              sys.exit(1)
+
+          print(f"Changelog format OK ({len(files)} file(s) checked)")
+          EOF

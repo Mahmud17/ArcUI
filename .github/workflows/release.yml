@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Check TOC version matches tag
+        run: |
+          TOC_VERSION=$(grep "^## Version:" ArcUI.toc | sed 's/^## Version:[[:space:]]*//')
+          TAG_VERSION="${{ steps.version.outputs.VERSION }}"
+          if [ "$TOC_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::TOC version ($TOC_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Run Lua syntax check
+        run: |
+          sudo apt-get install -y lua5.1
+          failed=0
+          while IFS= read -r -d '' file; do
+            if ! luac5.1 -p "$file" 2>&1; then
+              failed=1
+            fi
+          done < <(find . -name "*.lua" -not -path "./Libs/*" -print0)
+          exit $failed
+
+      - name: Package addon
+        run: |
+          mkdir -p dist/ArcUI
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='dist' \
+            --exclude='docs' \
+            . dist/ArcUI/
+          cd dist
+          zip -r ArcUI-${{ steps.version.outputs.VERSION }}.zip ArcUI/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ArcUI v${{ steps.version.outputs.VERSION }}
+          files: dist/ArcUI-${{ steps.version.outputs.VERSION }}.zip
+          generate_release_notes: false
