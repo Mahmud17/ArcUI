@@ -29,6 +29,8 @@ local castActive = false
 local castIsChannel = false
 local castStartTime = 0
 local castEndTime = 0
+local castPreviewActive = false
+local castTimingRefined = false  -- becomes true once UnitChannelInfo confirms channel timing
 
 -- ===================================================================
 -- FRAME CREATION
@@ -80,7 +82,7 @@ local function CreateCastbarFrames()
   frame.iconTex:SetAllPoints()
   frame.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-  -- Drag to move
+  -- Drag to move (whole bar click-drag)
   frame:SetScript("OnMouseDown", function(self, button)
     if button == "LeftButton" then
       local cfg = GetCastbarDB()
@@ -95,11 +97,64 @@ local function CreateCastbarFrames()
       local cfg = GetCastbarDB()
       if cfg then
         local point, _, relPoint, x, y = self:GetPoint()
-        cfg.barPosition = { point = point, relPoint = relPoint, x = x, y = y }
+        cfg.barPosition = { point = point, relPoint = relPoint, x = math.floor(x + 0.5), y = math.floor(y + 0.5) }
       end
     end
   end)
 
+  -- Corner drag handle (visible only when /arcui options are open)
+  local dragHandle = CreateFrame("Frame", nil, frame)
+  dragHandle:SetSize(14, 14)
+  dragHandle:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 2, -2)
+  dragHandle:SetFrameLevel(frame:GetFrameLevel() + 20)
+  dragHandle:EnableMouse(true)
+
+  local dhBG = dragHandle:CreateTexture(nil, "OVERLAY")
+  dhBG:SetAllPoints()
+  dhBG:SetColorTexture(0.15, 0.15, 0.15, 0.85)
+
+  local dhLine1 = dragHandle:CreateTexture(nil, "OVERLAY")
+  dhLine1:SetColorTexture(0.7, 0.7, 0.7, 0.9)
+  dhLine1:SetPoint("BOTTOMLEFT", dragHandle, "BOTTOMLEFT", 2, 2)
+  dhLine1:SetPoint("BOTTOMRIGHT", dragHandle, "BOTTOMRIGHT", -2, 2)
+  dhLine1:SetHeight(1)
+
+  local dhLine2 = dragHandle:CreateTexture(nil, "OVERLAY")
+  dhLine2:SetColorTexture(0.7, 0.7, 0.7, 0.9)
+  dhLine2:SetPoint("BOTTOMLEFT", dragHandle, "BOTTOMLEFT", 2, 5)
+  dhLine2:SetPoint("BOTTOMRIGHT", dragHandle, "BOTTOMRIGHT", -2, 5)
+  dhLine2:SetHeight(1)
+
+  local dhLine3 = dragHandle:CreateTexture(nil, "OVERLAY")
+  dhLine3:SetColorTexture(0.7, 0.7, 0.7, 0.9)
+  dhLine3:SetPoint("BOTTOMLEFT", dragHandle, "BOTTOMLEFT", 2, 8)
+  dhLine3:SetPoint("BOTTOMRIGHT", dragHandle, "BOTTOMRIGHT", -2, 8)
+  dhLine3:SetHeight(1)
+
+  dragHandle:SetScript("OnMouseDown", function(_, button)
+    if button == "LeftButton" then
+      frame:StartMoving()
+    end
+  end)
+  dragHandle:SetScript("OnMouseUp", function(_, button)
+    if button == "LeftButton" then
+      frame:StopMovingOrSizing()
+      local cfg = GetCastbarDB()
+      if cfg then
+        local point, _, relPoint, x, y = frame:GetPoint()
+        cfg.barPosition = { point = point, relPoint = relPoint, x = math.floor(x + 0.5), y = math.floor(y + 0.5) }
+      end
+    end
+  end)
+  dragHandle:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Drag to reposition castbar", 1, 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  dragHandle:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  dragHandle:Hide()
+
+  frame.dragHandle = dragHandle
   frame:Hide()
 
   -- Separate text frame: name + timer (anchored to mainFrame, not movable independently)
@@ -268,6 +323,13 @@ function ns.Castbar.ApplyAppearance()
 
   -- Movable
   mainFrame:EnableMouse(cfg.barMovable ~= false)
+
+  -- While options are open, keep bar visible so the user can see and drag it
+  if ns._arcUIOptionsOpen and ns.Castbar.ShowPreview then
+    ns.Castbar.ShowPreview()
+  else
+    if mainFrame.dragHandle then mainFrame.dragHandle:Hide() end
+  end
 end
 
 -- ===================================================================
@@ -276,6 +338,16 @@ end
 local function CastOnUpdate(self, elapsed)
   local cfg = GetCastbarDB()
   if not cfg then return end
+
+  -- Channels: refine timing from UnitChannelInfo on each tick until confirmed
+  if castIsChannel and not castTimingRefined then
+    local name, _, _, st, et = UnitChannelInfo("player")
+    if name and st and et and et > st then
+      castStartTime     = st / 1000
+      castEndTime       = et / 1000
+      castTimingRefined = true
+    end
+  end
 
   local now = GetTime()
   local total = castEndTime - castStartTime
@@ -312,28 +384,34 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
 
   local mainFrame, textFrame = GetOrCreateFrames()
 
-  castActive       = true
-  castIsChannel    = isChannel or false
-  castStartTime    = (startTimeMS or 0) / 1000
-  castEndTime      = (endTimeMS   or 0) / 1000
+  castActive          = true
+  castPreviewActive   = false
+  castTimingRefined   = false
+  castIsChannel       = isChannel or false
+  castStartTime       = (startTimeMS or 0) / 1000
+  castEndTime         = (endTimeMS   or 0) / 1000
 
-  -- Spell icon
-  if cfg.showIcon and spellID and spellID > 0 then
-    local tex = C_Spell.GetSpellTexture(spellID)
-    if tex then
-      mainFrame.iconTex:SetTexture(tex)
-      mainFrame.iconFrame:Show()
-    else
-      mainFrame.iconFrame:Hide()
+  -- Spell info (WoW 12.0: C_Spell.GetSpellInfo returns a table)
+  local spellName, spellIconID
+  if spellID and spellID > 0 then
+    local info = C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(spellID)
+    if info then
+      spellName  = info.name
+      spellIconID = info.iconID or info.originalIconID
     end
+  end
+
+  -- Icon
+  if cfg.showIcon and spellIconID then
+    mainFrame.iconTex:SetTexture(spellIconID)
+    mainFrame.iconFrame:Show()
   else
     mainFrame.iconFrame:Hide()
   end
 
   -- Spell name
   if cfg.showText then
-    local name = (C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)) or ""
-    textFrame.nameText:SetText(name)
+    textFrame.nameText:SetText(spellName or "")
   else
     textFrame.nameText:SetText("")
   end
@@ -359,6 +437,7 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
     textFrame.timerText:SetText("")
   end
 
+  if mainFrame.dragHandle then mainFrame.dragHandle:Hide() end
   mainFrame:Show()
   textFrame:Show()
   mainFrame:SetScript("OnUpdate", CastOnUpdate)
@@ -373,7 +452,49 @@ local function StopCast()
   if castTextFrame then
     castTextFrame:Hide()
   end
+  -- Restore preview if options panel is still open
+  if ns._arcUIOptionsOpen and ns.Castbar.ShowPreview then
+    ns.Castbar.ShowPreview()
+  end
 end
+
+-- ===================================================================
+-- PREVIEW (shown while options panel is open for positioning)
+-- ===================================================================
+local function ShowPreview()
+  local cfg = GetCastbarDB()
+  if not cfg or not cfg.enabled then return end
+  if castActive then return end  -- don't override a live cast
+
+  local mainFrame, textFrame = GetOrCreateFrames()
+  castPreviewActive = true
+
+  local color = cfg.barColor or {r=0.2, g=0.8, b=1, a=1}
+  mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
+  mainFrame.fillBar:SetValue(0.6)
+  mainFrame.iconFrame:Hide()
+
+  textFrame.nameText:SetText(cfg.showText and "Castbar Preview" or "")
+  textFrame.timerText:SetText(cfg.showTimer and "1.2" or "")
+
+  if mainFrame.dragHandle then mainFrame.dragHandle:Show() end
+  mainFrame:Show()
+  textFrame:Show()
+end
+ns.Castbar.ShowPreview = ShowPreview
+
+local function HidePreview()
+  if not castPreviewActive then return end
+  castPreviewActive = false
+  if not castActive then
+    if castFrameObj then
+      if castFrameObj.dragHandle then castFrameObj.dragHandle:Hide() end
+      castFrameObj:Hide()
+    end
+    if castTextFrame then castTextFrame:Hide() end
+  end
+end
+ns.Castbar.HidePreview = HidePreview
 
 -- ===================================================================
 -- EVENT HANDLER
@@ -381,6 +502,7 @@ end
 local castEventFrame = CreateFrame("Frame")
 castEventFrame:RegisterEvent("PLAYER_LOGIN")
 castEventFrame:RegisterEvent("UNIT_SPELLCAST_START")
+castEventFrame:RegisterEvent("UNIT_SPELLCAST_DELAYED")
 castEventFrame:RegisterEvent("UNIT_SPELLCAST_STOP")
 castEventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
 castEventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
@@ -417,21 +539,33 @@ castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellI
   if unit ~= "player" then return end
 
   if event == "UNIT_SPELLCAST_START" then
-    local name, _, _, startTimeMS, endTimeMS, _, _, notInterruptible = GetUnitCastingInfo("player")
+    local name, _, _, startTimeMS, endTimeMS, _, _, notInterruptible = UnitCastingInfo("player")
     if name then
       ShowCast(spellID, startTimeMS, endTimeMS, false, notInterruptible)
     end
 
   elseif event == "UNIT_SPELLCAST_CHANNEL_START" then
-    local name, _, _, startTimeMS, endTimeMS, _, notInterruptible = GetUnitChannelInfo("player")
-    if name then
-      ShowCast(spellID, startTimeMS, endTimeMS, true, notInterruptible)
+    -- UnitChannelInfo is unreliable at event fire time; show bar immediately using GetTime()+castTime.
+    -- CastOnUpdate polls UnitChannelInfo each tick and refines timing once available (usually first tick).
+    local startMS = GetTime() * 1000
+    local info = C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(spellID)
+    local duration = (info and info.castTime and info.castTime > 0) and info.castTime or 3000
+    ShowCast(spellID, startMS, startMS + duration, true, false)
+
+  elseif event == "UNIT_SPELLCAST_DELAYED" then
+    -- Cast was pushed back (hit while casting); update end time
+    if castActive and not castIsChannel then
+      local name, _, _, startTimeMS, endTimeMS = UnitCastingInfo("player")
+      if name then
+        castStartTime = (startTimeMS or 0) / 1000
+        castEndTime   = (endTimeMS   or 0) / 1000
+      end
     end
 
   elseif event == "UNIT_SPELLCAST_CHANNEL_UPDATE" then
     -- Channel speed changed (e.g. Sped Up buff)
     if castActive and castIsChannel then
-      local name, _, _, startTimeMS, endTimeMS = GetUnitChannelInfo("player")
+      local name, _, _, startTimeMS, endTimeMS = UnitChannelInfo("player")
       if name then
         castStartTime = (startTimeMS or 0) / 1000
         castEndTime   = (endTimeMS   or 0) / 1000
@@ -452,6 +586,13 @@ end)
 -- ===================================================================
 function ns.Castbar.Init()
   ns.Castbar.ApplyAppearance()
+  if ns.CDMShared and ns.CDMShared.RegisterPanelCallback then
+    ns.CDMShared.RegisterPanelCallback("Castbar", {
+      onOpen  = ShowPreview,
+      onClose = HidePreview,
+    })
+  end
+  if ns._arcUIOptionsOpen then ShowPreview() end
 end
 
 -- ===================================================================

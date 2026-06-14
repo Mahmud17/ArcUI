@@ -579,7 +579,7 @@ ns.DB_DEFAULTS = {
       textColor = {r=1, g=1, b=1, a=1},
       textOutline = "THICKOUTLINE",
       barMovable = true,
-      barPosition = {point="CENTER", relPoint="CENTER", x=0, y=-100},
+      barPosition = {point="CENTER", relPoint="CENTER", x=0, y=0},
       barFrameStrata = "MEDIUM",
       barFrameLevel = 10,
       hideOutOfCombat = false,

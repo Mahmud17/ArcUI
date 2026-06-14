@@ -423,9 +423,49 @@ function ns.CastbarOptions.GetOptionsTable()
 
       positionDesc = {
         type = "description",
-        name = "|cffaaaaaaLeft-click and drag the bar to reposition it. The position is saved automatically.|r",
+        name = "|cffaaaaaaDrag the grip handle (bottom-right corner, visible while this panel is open) or adjust X/Y below. Position is saved automatically.|r",
         order = 72,
         fontSize = "small",
+      },
+
+      posX = {
+        type = "range",
+        name = "X Offset",
+        desc = "Horizontal offset from screen center.",
+        order = 73,
+        min = -2000, max = 2000, step = 1, bigStep = 10,
+        get = function()
+          local c = GetCastbarDB()
+          return (c and c.barPosition and c.barPosition.x) or 0
+        end,
+        set = function(_, v)
+          local c = GetCastbarDB()
+          if c then
+            c.barPosition = c.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=0}
+            c.barPosition.x = v
+            Refresh()
+          end
+        end,
+      },
+
+      posY = {
+        type = "range",
+        name = "Y Offset",
+        desc = "Vertical offset from screen center.",
+        order = 74,
+        min = -1000, max = 1000, step = 1, bigStep = 10,
+        get = function()
+          local c = GetCastbarDB()
+          return (c and c.barPosition and c.barPosition.y) or 0
+        end,
+        set = function(_, v)
+          local c = GetCastbarDB()
+          if c then
+            c.barPosition = c.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=0}
+            c.barPosition.y = v
+            Refresh()
+          end
+        end,
       },
 
       -- ── Frame Strata ───────────────────────────────────────────────
