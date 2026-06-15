@@ -93,6 +93,23 @@ function ns.CastbarOptions.GetOptionsTable()
         end,
       },
 
+      empowerColor = {
+        type = "color",
+        name = "Empowered Color",
+        desc = "Color of the bar during an empowered cast (e.g. Evoker spells). Stage dividers are shown as white lines.",
+        order = 13,
+        hasAlpha = true,
+        get = function()
+          local c = GetCastbarDB()
+          local col = c and c.empowerColor or {r=0.6, g=0.2, b=1, a=1}
+          return col.r, col.g, col.b, col.a or 1
+        end,
+        set = function(_, r, g, b, a)
+          local c = GetCastbarDB()
+          if c then c.empowerColor = {r=r, g=g, b=b, a=a}; Refresh() end
+        end,
+      },
+
       texture = {
         type = "select",
         name = "Texture",

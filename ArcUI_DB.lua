@@ -563,6 +563,7 @@ ns.DB_DEFAULTS = {
       height = 20,
       barColor = {r=0.2, g=0.8, b=1, a=1},
       channelColor = {r=0.2, g=1, b=0.4, a=1},
+      empowerColor = {r=0.6, g=0.2, b=1, a=1},
       texture = "Blizzard",
       opacity = 1.0,
       showBackground = true,
