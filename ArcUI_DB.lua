@@ -585,6 +585,14 @@ ns.DB_DEFAULTS = {
       barFrameLevel = 10,
       hideOutOfCombat = false,
       hideChannels = false,
+      empowerSegmentColorsEnabled = false,
+      empowerSegmentColors = {
+        [1] = {r=0.6, g=0.2, b=1.0, a=1},
+        [2] = {r=0.9, g=0.1, b=0.6, a=1},
+        [3] = {r=1.0, g=0.3, b=0.1, a=1},
+        [4] = {r=1.0, g=0.7, b=0.1, a=1},
+      },
+      presets = {},
     },
 
     -- LEGACY: CDM Enhancement settings were moved to profile storage

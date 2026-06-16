@@ -36,6 +36,15 @@ local castPreviewActive = false
 local castTimingRefined = false
 
 -- ===================================================================
+-- DEBUG
+-- Toggle with /arccastdebug
+-- ===================================================================
+local arcCastDebug = false
+local function CastDebug(...)
+  if arcCastDebug then print("|cff00ff00[ArcCast]|r", ...) end
+end
+
+-- ===================================================================
 -- FRAME CREATION
 -- ===================================================================
 local function CreateCastbarFrames()
@@ -85,19 +94,18 @@ local function CreateCastbarFrames()
   frame.iconTex:SetAllPoints()
   frame.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-  -- Stage markers for empowered casts (up to 4 stages = up to 3 dividers)
-  frame.stageMarkerFrame = CreateFrame("Frame", nil, frame)
-  frame.stageMarkerFrame:SetAllPoints()
-  frame.stageMarkerFrame:SetFrameLevel(frame:GetFrameLevel() + 5)
-  frame.stageMarkers = {}
+  -- Segment bars for empowered casts — one StatusBar per stage, fills with its own color
+  frame.stageSegBars = {}
   for i = 1, 4 do
-    local m = frame.stageMarkerFrame:CreateTexture(nil, "OVERLAY")
-    m:SetWidth(2)
-    m:SetColorTexture(1, 1, 1, 0.75)
-    m:SetSnapToPixelGrid(false)
-    m:SetTexelSnappingBias(0)
-    m:Hide()
-    frame.stageMarkers[i] = m
+    local sb = CreateFrame("StatusBar", nil, frame)
+    sb:SetMinMaxValues(0, 1)
+    sb:SetValue(0)
+    sb:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    sb:SetStatusBarColor(1, 1, 1, 1)
+    sb:SetFrameLevel(frame:GetFrameLevel() + 3)
+    sb:EnableMouse(false)
+    sb:Hide()
+    frame.stageSegBars[i] = sb
   end
 
   -- Blue "DRAG" overlay shown when drag mode is active (child of frame so it follows during move)
@@ -343,7 +351,9 @@ function ns.Castbar.ApplyAppearance()
   mainFrame:SetFrameStrata(strata)
   mainFrame:SetFrameLevel(level)
   mainFrame.fillBar:SetFrameLevel(level + 2)
-  if mainFrame.stageMarkerFrame then mainFrame.stageMarkerFrame:SetFrameLevel(level + 6) end
+  if mainFrame.stageSegBars then
+    for _, sb in ipairs(mainFrame.stageSegBars) do sb:SetFrameLevel(level + 3) end
+  end
   mainFrame.borderOverlay:SetFrameLevel(level + 10)
   mainFrame.iconFrame:SetFrameLevel(level + 5)
   textFrame:SetFrameStrata(strata)
@@ -370,6 +380,9 @@ function ns.Castbar.ApplyAppearance()
     texPath = LSM:Fetch("statusbar", cfg.texture) or texPath
   end
   mainFrame.fillBar:SetStatusBarTexture(texPath)
+  if mainFrame.stageSegBars then
+    for _, sb in ipairs(mainFrame.stageSegBars) do sb:SetStatusBarTexture(texPath) end
+  end
 
   -- Icon
   local iconSize = PixelSize(cfg.iconSize or 20)
@@ -404,33 +417,64 @@ function ns.Castbar.ApplyAppearance()
 end
 
 -- ===================================================================
--- STAGE MARKERS (empowered casts)
+-- EMPOWERED SEGMENT BARS
 -- ===================================================================
-local function HideStageMarkers()
-  if not castFrameObj or not castFrameObj.stageMarkers then return end
-  for i = 1, 4 do
-    if castFrameObj.stageMarkers[i] then castFrameObj.stageMarkers[i]:Hide() end
+local function HideEmpowerVisuals()
+  if not castFrameObj then return end
+  if castFrameObj.stageSegBars then
+    for i = 1, 4 do
+      if castFrameObj.stageSegBars[i] then castFrameObj.stageSegBars[i]:Hide() end
+    end
   end
+  -- Ensure the main fill bar is visible for non-segment mode
+  if castFrameObj.fillBar then castFrameObj.fillBar:Show() end
 end
 
-local function PlaceStageMarkers()
-  if not castFrameObj or not castFrameObj.stageMarkers then return end
-  local barW = castFrameObj:GetWidth()
+local function PlaceSegmentBars()
+  if not castFrameObj then return end
+  local cfg    = GetCastbarDB()
+  local barW   = castFrameObj:GetWidth()
+  local barH   = castFrameObj:GetHeight()
+  local segs   = castFrameObj.stageSegBars
+  -- In preview mode (options panel open, no live cast) show a 4-stage demo layout
+  local nStage = castEmpowerNumStages
+  local props  = castEmpowerStageProps
+  if castPreviewActive and nStage == 0 then
+    nStage = 4
+    props  = {0.25, 0.5, 0.75}
+  end
+  local useSegs = cfg and cfg.empowerSegmentColorsEnabled and nStage > 0
+
+  -- Switch between single fill bar and per-segment bars
+  if useSegs then
+    castFrameObj.fillBar:Hide()
+  else
+    castFrameObj.fillBar:Show()
+  end
+
   for i = 1, 4 do
-    local m = castFrameObj.stageMarkers[i]
-    local p = castEmpowerStageProps[i]
-    -- show dividers for stages 1 .. numStages-1 (the gaps between stages)
-    if p and i < castEmpowerNumStages then
-      local xOff = PixelSize(p * barW)
-      m:ClearAllPoints()
-      m:SetPoint("TOPLEFT",    castFrameObj, "TOPLEFT",    xOff - 1, 0)
-      m:SetPoint("BOTTOMLEFT", castFrameObj, "BOTTOMLEFT", xOff - 1, 0)
-      m:Show()
-    else
-      m:Hide()
+    local sb = segs and segs[i]
+    if sb then
+      if useSegs and i <= nStage then
+        local segStart = i > 1 and (props[i-1] or 0) or 0
+        local segEnd   = props[i] or 1
+        local segW     = math.max(1, PixelSize((segEnd - segStart) * barW))
+        local segX     = PixelSize(segStart * barW)
+        sb:SetSize(segW, barH)
+        sb:ClearAllPoints()
+        sb:SetPoint("TOPLEFT", castFrameObj, "TOPLEFT", segX, 0)
+        local cols = cfg and cfg.empowerSegmentColors
+        local c    = cols and cols[i] or {r=1, g=1, b=1, a=1}
+        sb:SetStatusBarColor(c.r or 1, c.g or 1, c.b or 1, c.a or 1)
+        sb:SetValue(0)
+        sb:Show()
+      else
+        sb:Hide()
+      end
     end
   end
 end
+ns.Castbar.RefreshSegmentBars = PlaceSegmentBars
 
 -- ===================================================================
 -- ONUPDATE (only runs during an active cast)
@@ -439,13 +483,30 @@ local function CastOnUpdate(self, elapsed)
   local cfg = GetCastbarDB()
   if not cfg then return end
 
-  -- Regular channels: refine timing from UnitChannelInfo on each tick until confirmed.
-  -- Empowered casts already have accurate timing (castTimingRefined=true), so skip.
+  -- Regular channels: refine timing on each tick until we get valid server timestamps.
   if castIsChannel and not castIsEmpowered and not castTimingRefined then
     local name, _, _, st, et = UnitChannelInfo("player")
-    if name and st and et and et > st then
+    if name and st and st > 0 and et and et > st then
       castStartTime     = st / 1000
       castEndTime       = et / 1000
+      castTimingRefined = true
+    end
+  end
+
+  -- Empowered casts: refine timing if server timestamps weren't ready at EMPOWER_START time.
+  if castIsEmpowered and not castTimingRefined then
+    local n2, _, _, st2, et2, _, _, _, _, ns2 = UnitChannelInfo("player")
+    if n2 and st2 and st2 > 0 and et2 and et2 > st2 then
+      local ha = (GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player")) or 0
+      castStartTime = st2 / 1000
+      castEndTime   = (et2 + ha) / 1000
+      if ns2 and ns2 > 0 then
+        castEmpowerNumStages = ns2
+        local newProps = {}
+        for i = 1, ns2 - 1 do newProps[i] = i / ns2 end
+        castEmpowerStageProps = newProps
+        PlaceSegmentBars()
+      end
       castTimingRefined = true
     end
   end
@@ -466,6 +527,29 @@ local function CastOnUpdate(self, elapsed)
 
   castFrameObj.fillBar:SetValue(progress)
 
+  -- Per-stage segment fills (empowered only)
+  local segs = castFrameObj and castFrameObj.stageSegBars
+  if castIsEmpowered and segs and cfg.empowerSegmentColorsEnabled then
+    for i = 1, castEmpowerNumStages do
+      local sb = segs[i]
+      if sb and sb:IsShown() then
+        local props    = castEmpowerStageProps or {}
+        local segStart = i > 1 and (props[i-1] or 0) or 0
+        local segEnd   = props[i] or 1
+        local segDur  = segEnd - segStart
+        local segFill
+        if segDur > 0 then
+          segFill = math.max(0, math.min(1, (progress - segStart) / segDur))
+        elseif progress >= segEnd then
+          segFill = 1
+        else
+          segFill = 0
+        end
+        sb:SetValue(segFill)
+      end
+    end
+  end
+
   -- Live countdown timer
   if cfg.showTimer then
     local remaining = castEndTime - now
@@ -479,9 +563,23 @@ end
 -- ===================================================================
 local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterruptible, isEmpowered, numStages, stageProps)
   local cfg = GetCastbarDB()
-  if not cfg or not cfg.enabled then return end
-  if cfg.hideOutOfCombat and not InCombatLockdown() then return end
-  if isChannel and not isEmpowered and cfg.hideChannels then return end
+  if not cfg or not cfg.enabled then
+    CastDebug("ShowCast blocked: castbar disabled (spellID=" .. tostring(spellID) .. ")")
+    return
+  end
+  if cfg.hideOutOfCombat and not InCombatLockdown() then
+    CastDebug("ShowCast blocked: hideOutOfCombat is on and not in combat (spellID=" .. tostring(spellID) .. ")")
+    return
+  end
+  if isChannel and not isEmpowered and cfg.hideChannels then
+    CastDebug("ShowCast blocked: hideChannels is on (spellID=" .. tostring(spellID) .. ")")
+    return
+  end
+  CastDebug("ShowCast: spellID=" .. tostring(spellID)
+    .. " isChannel=" .. tostring(isChannel)
+    .. " isEmpowered=" .. tostring(isEmpowered)
+    .. " start=" .. tostring(startTimeMS)
+    .. " end=" .. tostring(endTimeMS))
 
   local mainFrame, textFrame = GetOrCreateFrames()
 
@@ -547,16 +645,16 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
   mainFrame:Show()
   textFrame:Show()
   if castIsEmpowered then
-    PlaceStageMarkers()
+    PlaceSegmentBars()
   else
-    HideStageMarkers()
+    HideEmpowerVisuals()
   end
   mainFrame:SetScript("OnUpdate", CastOnUpdate)
 end
 
 local function StopCast()
   castActive = false
-  HideStageMarkers()
+  HideEmpowerVisuals()
   castIsEmpowered      = false
   castEmpowerNumStages  = 0
   castEmpowerStageProps = {}
@@ -584,9 +682,21 @@ local function ShowPreview()
   local mainFrame, textFrame = GetOrCreateFrames()
   castPreviewActive = true
 
-  local color = cfg.barColor or {r=0.2, g=0.8, b=1, a=1}
-  mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
-  mainFrame.fillBar:SetValue(0.6)
+  -- Show empowered segment preview when that option is on; otherwise show plain fill bar
+  if cfg.empowerSegmentColorsEnabled then
+    PlaceSegmentBars()
+    -- Partially fill each visible segment so the color is obvious in the preview
+    if mainFrame.stageSegBars then
+      for i, sb in ipairs(mainFrame.stageSegBars) do
+        if sb:IsShown() then sb:SetValue(i == 1 and 1 or i == 2 and 0.6 or 0) end
+      end
+    end
+  else
+    HideEmpowerVisuals()
+    local color = cfg.barColor or {r=0.2, g=0.8, b=1, a=1}
+    mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
+    mainFrame.fillBar:SetValue(0.6)
+  end
   mainFrame.iconFrame:Hide()
 
   textFrame.nameText:SetText(cfg.showText and "Castbar Preview" or "")
@@ -605,6 +715,7 @@ local function HidePreview()
   if not castPreviewActive then return end
   castPreviewActive = false
   if not castActive then
+    HideEmpowerVisuals()
     if castFrameObj then
       if castFrameObj.dragToggleBtn then
         castFrameObj.dragToggleBtn.SetDragActive(false)
@@ -636,10 +747,25 @@ castEventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
 castEventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_UPDATE")
 castEventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 castEventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+castEventFrame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED")
+castEventFrame:RegisterEvent("PLAYER_TALENT_UPDATE")
 
 castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellID)
   if event == "PLAYER_LOGIN" then
     ns.Castbar.Init()
+    return
+  end
+
+  -- Spec/talent change — re-run auto-switch presets for the castbar
+  if event == "ACTIVE_PLAYER_SPECIALIZATION_CHANGED" or event == "PLAYER_TALENT_UPDATE" then
+    C_Timer.After(0.1, function()
+      local cfg = GetCastbarDB()
+      if cfg and ns.Presets and ns.Presets.RunAutoSwitch then
+        if ns.Presets.RunAutoSwitch(cfg, "castbar") then
+          ns.Castbar.ApplyAppearance()
+        end
+      end
+    end)
     return
   end
 
@@ -664,51 +790,85 @@ castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellI
 
   if event == "UNIT_SPELLCAST_START" then
     local name, _, _, startTimeMS, endTimeMS, _, _, notInterruptible = UnitCastingInfo("player")
+    CastDebug("SPELLCAST_START: spellID=" .. tostring(spellID) .. " name=" .. tostring(name))
     if name then
       ShowCast(spellID, startTimeMS, endTimeMS, false, notInterruptible)
     end
 
-  elseif event == "UNIT_SPELLCAST_CHANNEL_START" or event == "UNIT_SPELLCAST_EMPOWER_START" then
-    -- UnitChannelInfo is the canonical source for both regular channels and empowered casts.
-    -- numEmpowerStages > 0 signals an empowered cast (fills L→R with stage dividers).
-    local name, _, _, startTimeMS, endTimeMS, _, _, chanSpellID, _, numStages = UnitChannelInfo("player")
-    if name then
-      local useSpellID = chanSpellID or spellID
-      local isEmpoweredCast = numStages and numStages > 0
+elseif event == "UNIT_SPELLCAST_CHANNEL_START"
+      or event == "UNIT_SPELLCAST_EMPOWER_START" then
+
+    local isEmpowerEvent = (event == "UNIT_SPELLCAST_EMPOWER_START")
+
+    local function TryStartCast(savedSpellID)
+      local name, _, _, startTimeMS, endTimeMS, _, _, chanSpellID, _, numStages = UnitChannelInfo("player")
+      CastDebug("TryStartCast: event=" .. event
+        .. " name=" .. tostring(name)
+        .. " chanSpellID=" .. tostring(chanSpellID)
+        .. " savedSpellID=" .. tostring(savedSpellID)
+        .. " numStages=" .. tostring(numStages)
+        .. " startMS=" .. tostring(startTimeMS)
+        .. " endMS=" .. tostring(endTimeMS))
+      if not name then
+        CastDebug("TryStartCast: UnitChannelInfo returned nil — will defer")
+        return false
+      end
+
+      local useSpellID   = chanSpellID or savedSpellID
+      -- Treat as empowered if UnitChannelInfo says so OR if the event was EMPOWER_START
+      local isEmpoweredCast = isEmpowerEvent or (numStages and numStages > 0)
+      CastDebug("TryStartCast: isEmpowerEvent=" .. tostring(isEmpowerEvent)
+        .. " isEmpoweredCast=" .. tostring(isEmpoweredCast))
+
       if isEmpoweredCast then
-        -- Add hold-at-max time so the bar ends after the player can release at full charge
-        local holdAtMax = GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player") or 0
-        local totalEndMS = endTimeMS + holdAtMax
-        local totalDurMS = totalEndMS - startTimeMS
-        -- Calculate per-stage boundary proportions using per-stage hold durations
+        local stageCount = (numStages and numStages > 0) and numStages or 4
+        local ha = (GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player")) or 0
+        local totalEndMS = endTimeMS + ha
+        -- Equal-distribution stage boundaries (safe: avoids GetUnitEmpowerStageDuration secrets)
         local stageProps = {}
-        local cumMS = 0
-        for i = 1, numStages - 1 do
-          local stageDur
-          if GetUnitEmpowerStageDuration then
-            stageDur = GetUnitEmpowerStageDuration("player", i)
-          end
-          if not stageDur or stageDur <= 0 then
-            stageDur = totalDurMS / numStages
-          end
-          cumMS = cumMS + stageDur
-          stageProps[i] = math.min(cumMS / totalDurMS, 0.99)
-        end
-        castTimingRefined = true
-        ShowCast(useSpellID, startTimeMS, totalEndMS, false, false, true, numStages, stageProps)
+        for i = 1, stageCount - 1 do stageProps[i] = i / stageCount end
+        -- Use placeholder timing if server timestamps not ready yet; CastOnUpdate refines.
+        local useStart = (startTimeMS and startTimeMS > 0) and startTimeMS or (GetTime() * 1000)
+        local useEnd   = ((totalEndMS - useStart) > 0)    and totalEndMS  or (useStart + 5000)
+        ShowCast(useSpellID, useStart, useEnd, false, false, true, stageCount, stageProps)
       else
-        -- Regular channel (e.g. Spinning Crane Kick): accurate timing from UnitChannelInfo directly
-        castTimingRefined = true
         ShowCast(useSpellID, startTimeMS, endTimeMS, true, false)
       end
-    else
-      -- UnitChannelInfo unavailable at event fire (very rare edge case)
-      local startMS = GetTime() * 1000
-      ShowCast(spellID, startMS, startMS + 3000, true, false)
+      return true
+    end
+
+    if not TryStartCast(spellID) then
+      -- UnitChannelInfo not yet populated (race condition at event fire).
+      -- Defer one frame; if the cast is still active UnitChannelInfo will have data.
+      -- Never fall back to isChannel=true for EMPOWER events (would be hidden by hideChannels).
+      CastDebug("TryStartCast returned nil — scheduling 1-frame defer for spellID=" .. tostring(spellID))
+      local savedSpellID = spellID
+      C_Timer.After(0, function()
+        if castActive then
+          CastDebug("Deferred TryStartCast: cast already active, skipping")
+          return
+        end
+        local n = select(1, UnitChannelInfo("player"))
+        CastDebug("Deferred TryStartCast: UnitChannelInfo name=" .. tostring(n))
+        if n then TryStartCast(savedSpellID) end
+      end)
     end
 
   elseif event == "UNIT_SPELLCAST_EMPOWER_UPDATE" then
-    -- Stage was reached; OnUpdate handles fill progress via time comparison; nothing needed here
+    -- Catch-all: if EMPOWER_START was missed entirely (nil race resolved too late),
+    -- initialize the bar now using current UnitChannelInfo data.
+    if not castActive then
+      local name, _, _, startTimeMS, endTimeMS, _, _, chanSpellID, _, numStages = UnitChannelInfo("player")
+      if name then
+        local useSpellID = chanSpellID or spellID
+        local stageCount = (numStages and numStages > 0) and numStages or 4
+        local ha = (GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player")) or 0
+        local totalEndMS = endTimeMS + ha
+        local stageProps = {}
+        for i = 1, stageCount - 1 do stageProps[i] = i / stageCount end
+        ShowCast(useSpellID, startTimeMS, totalEndMS, false, false, true, stageCount, stageProps)
+      end
+    end
 
   elseif event == "UNIT_SPELLCAST_DELAYED" then
     -- Cast was pushed back (hit while casting); update end time
@@ -732,13 +892,69 @@ castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellI
 
   elseif event == "UNIT_SPELLCAST_STOP"
       or event == "UNIT_SPELLCAST_FAILED"
-      or event == "UNIT_SPELLCAST_INTERRUPTED"
-      or event == "UNIT_SPELLCAST_SUCCEEDED"
-      or event == "UNIT_SPELLCAST_CHANNEL_STOP"
+      or event == "UNIT_SPELLCAST_INTERRUPTED" then
+    StopCast()
+
+  elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+    -- Channels and empowered casts fire SUCCEEDED while still running (spell commits to server).
+    -- Let CHANNEL_STOP / EMPOWER_STOP handle the actual end.
+    if not castIsChannel and not castIsEmpowered then StopCast() end
+
+  elseif event == "UNIT_SPELLCAST_CHANNEL_STOP"
       or event == "UNIT_SPELLCAST_EMPOWER_STOP" then
     StopCast()
   end
 end)
+
+-- ===================================================================
+-- DEBUG SLASH COMMAND  (/arccastdebug)
+-- ===================================================================
+SLASH_ARCCASTDEBUG1 = "/arccastdebug"
+SlashCmdList["ARCCASTDEBUG"] = function()
+  arcCastDebug = not arcCastDebug
+  local cfg = GetCastbarDB()
+  local state = arcCastDebug and "|cff00ff00ON|r" or "|cffff4444OFF|r"
+  print("|cff00ff00[ArcCast]|r Debug " .. state)
+  if arcCastDebug and cfg then
+    print("|cff00ff00[ArcCast]|r Config dump:")
+    print("  enabled=" .. tostring(cfg.enabled))
+    print("  hideChannels=" .. tostring(cfg.hideChannels))
+    print("  hideOutOfCombat=" .. tostring(cfg.hideOutOfCombat))
+    print("  castActive=" .. tostring(castActive))
+    print("  castIsChannel=" .. tostring(castIsChannel))
+    print("  castIsEmpowered=" .. tostring(castIsEmpowered))
+    print("  castEmpowerNumStages=" .. tostring(castEmpowerNumStages))
+    print("  InCombat=" .. tostring(InCombatLockdown()))
+    local n, _, _, st, et, _, _, sid, _, ns2 = UnitChannelInfo("player")
+    if n then
+      print("  UnitChannelInfo: name=" .. tostring(n) .. " spellID=" .. tostring(sid)
+        .. " numStages=" .. tostring(ns2) .. " startMS=" .. tostring(st) .. " endMS=" .. tostring(et))
+    else
+      print("  UnitChannelInfo: nil (no active channel/empower)")
+    end
+    local cn = select(1, UnitCastingInfo("player"))
+    print("  UnitCastingInfo: name=" .. tostring(cn))
+  end
+end
+
+-- Expose castbar state for the global /arcdebug command in ArcUI_Options.lua
+function ns.Castbar.GetStatus()
+  local cfg = GetCastbarDB()
+  local kind = castIsEmpowered and "empowered" or castIsChannel and "channel" or "cast"
+  return {
+    enabled           = cfg and cfg.enabled         or false,
+    hideChannels      = cfg and cfg.hideChannels     or false,
+    hideOutOfCombat   = cfg and cfg.hideOutOfCombat  or false,
+    showIcon          = cfg and cfg.showIcon         or false,
+    showTimer         = cfg and cfg.showTimer        or false,
+    showText          = cfg and cfg.showText         or false,
+    width             = cfg and cfg.width            or 0,
+    height            = cfg and cfg.height           or 0,
+    castActive        = castActive,
+    castKind          = kind,
+    castEmpowerStages = castEmpowerNumStages,
+  }
+end
 
 -- ===================================================================
 -- INIT
