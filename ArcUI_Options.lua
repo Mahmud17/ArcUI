@@ -952,6 +952,130 @@ SlashCmdList["ARCBARS"] = function(msg)
 end
 
 -- ===================================================================
+-- /arcdebug  — full system overview
+-- ===================================================================
+SLASH_ARCDEBUG1 = "/arcdebug"
+SlashCmdList["ARCDEBUG"] = function()
+  local ver = C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?"
+  local db  = ns.db and ns.db.char
+
+  local sep = "|cff444444" .. string.rep("-", 44) .. "|r"
+  local function yn(v)  return v and "|cff00ff00yes|r" or "|cffff5555no|r" end
+  local function hi(s)  return "|cffffd100" .. tostring(s) .. "|r" end
+  local function dim(s) return "|cff888888" .. tostring(s) .. "|r" end
+
+  print(sep)
+  print("|cff00ccffArcUI|r v" .. hi(ver) .. "   " .. dim(date("%H:%M:%S")) .. "   combat=" .. yn(InCombatLockdown()))
+  print(sep)
+
+  -- Castbar
+  if ns.Castbar and ns.Castbar.GetStatus then
+    local s = ns.Castbar.GetStatus()
+    local detail = ""
+    if s.enabled and s.castActive then
+      local stages = s.castEmpowerStages > 0 and (" x" .. s.castEmpowerStages) or ""
+      detail = "  " .. dim("[" .. s.castKind .. stages .. "]")
+    end
+    print("  Castbar       " .. yn(s.enabled) .. detail)
+    if s.enabled then
+      local flags = {}
+      if s.hideChannels    then flags[#flags+1] = "hide-channels" end
+      if s.hideOutOfCombat then flags[#flags+1] = "hide-ooc"      end
+      if #flags > 0 then print("    " .. dim(table.concat(flags, "  "))) end
+    end
+  else
+    print("  Castbar       " .. dim("module not loaded"))
+  end
+
+  -- Aura bars — tracking.enabled is the active flag (same logic as GetActiveBars)
+  do
+    local activeCount = ns.API.GetActiveBars and #ns.API.GetActiveBars() or 0
+    local total = 0
+    if db and db.bars then
+      for i = 1, 500 do if db.bars[i] then total = total + 1 end end
+    end
+    print("  Aura Bars     " .. hi(activeCount) .. " enabled / " .. dim(total .. " configured"))
+  end
+
+  -- Resource bars — tracking.enabled (same logic as GetActiveResourceBars)
+  do
+    local activeCount = ns.API.GetActiveResourceBars and #ns.API.GetActiveResourceBars() or 0
+    local total = 0
+    if db and db.resourceBars then
+      for i = 1, 50 do if db.resourceBars[i] then total = total + 1 end end
+    end
+    print("  Resource Bars " .. hi(activeCount) .. " enabled / " .. dim(total .. " configured"))
+  end
+
+  -- Cooldown bars (nested: cooldownBarConfigs[spellID][barType])
+  do
+    local cdTotal = 0
+    if db and db.cooldownBarConfigs then
+      for _, configs in pairs(db.cooldownBarConfigs) do
+        for _, cfg in pairs(configs) do
+          if type(cfg) == "table" then cdTotal = cdTotal + 1 end
+        end
+      end
+    end
+    print("  Cooldown Bars " .. hi(cdTotal) .. " configured")
+  end
+
+  -- Timer bars
+  do
+    local total = 0
+    if db and db.timerBarConfigs then
+      for _, cfg in pairs(db.timerBarConfigs) do
+        if type(cfg) == "table" then total = total + 1 end
+      end
+    end
+    print("  Timer Bars    " .. hi(total) .. " configured")
+  end
+
+  -- Cooldown Reminder
+  do
+    local crDB = db and db.cooldownReminder
+    print("  CD Reminder   " .. yn(crDB and crDB.enabled))
+  end
+
+  print(sep)
+
+  -- CDM Enhancement
+  if ns.CDMShared then
+    print("  CDM Enhance   " .. yn(ns.CDMShared.IsCDMStylingEnabled()))
+  else
+    print("  CDM Enhance   " .. dim("module not loaded"))
+  end
+
+  -- CDM Groups
+  if ns.CDMGroups then
+    local groupCount, freeCount = 0, 0
+    if ns.CDMGroups.groups then
+      for _ in pairs(ns.CDMGroups.groups) do groupCount = groupCount + 1 end
+    end
+    if ns.CDMGroups.freeIcons then
+      for _ in pairs(ns.CDMGroups.freeIcons) do freeCount = freeCount + 1 end
+    end
+    print("  CDM Groups    " .. hi(groupCount) .. " groups / " .. hi(freeCount) .. " free icons")
+  else
+    print("  CDM Groups    " .. dim("module not loaded"))
+  end
+
+  -- Arc Auras
+  if ns.ArcAuras then
+    local arcCount = 0
+    local frames = ns.ArcAuras.frames or {}
+    for _ in pairs(frames) do arcCount = arcCount + 1 end
+    print("  Arc Auras     " .. hi(arcCount) .. " tracked")
+  else
+    print("  Arc Auras     " .. dim("module not loaded"))
+  end
+
+  print(sep)
+  print(dim("  /arcui  /arccastdebug  /arcmasque  /arcrepair"))
+  print(sep)
+end
+
+-- ===================================================================
 -- MAIN INITIALIZATION
 -- ===================================================================
 local initFrame = CreateFrame("Frame")
