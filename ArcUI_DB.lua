@@ -619,6 +619,8 @@ ns.DB_DEFAULTS = {
       matchWidthAdjust = 0,
       -- Default tick count for all channels (0 = disabled; per-spell override takes precedence)
       tickMarksDefaultCount = 0,
+      -- Reverse fill direction: channels fill instead of drain; casts drain instead of fill
+      reverseFill = false,
       presets = {},
     },
 

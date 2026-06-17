@@ -39,7 +39,7 @@ local castNotInterruptible = false -- true when the current cast cannot be inter
 local activeTicks = 0              -- number of tick dividers currently shown (0 = none)
 local castCurrentGUID  = nil   -- GUID from the CHANNEL/EMPOWER_START that opened the current bar
 local castChannelEnded = false -- true between CHANNEL_STOP and the next CHANNEL_START (hold window)
-local channelStopTime  = 0     -- GetTime() when CHANNEL_STOP fired (drives the 0.35 s hold)
+local channelStopTime  = 0     -- GetTime() when CHANNEL_STOP fired
 -- ===================================================================
 -- DEBUG
 -- Toggle with /arccastdebug
@@ -631,11 +631,20 @@ local function CastOnUpdate(self, elapsed)
   local cfg = GetCastbarDB()
     if not cfg then return end
     if castChannelEnded and castIsChannel and not castIsEmpowered then
-      if (GetTime() - channelStopTime) > 0.35 then
-          StopCast()
-          return
+      if (GetTime() - channelStopTime) > 0.01 then
+        StopCast()
+        return
       end
-  end
+    end
+    -- Safety net: if timing shows the channel is well past its end and CHANNEL_STOP was
+    -- somehow missed, stop the bar so it never stays as a ghost.
+    if castIsChannel and not castIsEmpowered and castTimingRefined and not castChannelEnded then
+      if (GetTime() - castEndTime) > 1.5 then
+        CastDebug("Safety net: channel past end time, stopping")
+        StopCast()
+        return
+      end
+    end
   -- Regular channels: refine timing on each tick until we get valid server timestamps.
   if castIsChannel and not castIsEmpowered and not castTimingRefined then
     local name, _, _, st, et = UnitChannelInfo("player")
@@ -670,13 +679,12 @@ local function CastOnUpdate(self, elapsed)
 
   local progress
   if castIsChannel and not castIsEmpowered then
-    -- Regular channels drain from full to empty
     progress = 1.0 - (now - castStartTime) / total
   else
-    -- Normal casts and empowered casts fill left to right
     progress = (now - castStartTime) / total
   end
   progress = math.max(0, math.min(1, progress))
+  if cfg.reverseFill then progress = 1.0 - progress end
 
   castFrameObj.fillBar:SetValue(progress)
 
@@ -780,8 +788,10 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
   if overrideTex then mainFrame.fillBar:SetStatusBarTexture(overrideTex) end
   ApplyBorder(mainFrame, cfg, borderOvr)
 
-  -- Initial fill: regular channels start full (drain R→L); casts and empowered start empty (fill L→R)
-  mainFrame.fillBar:SetValue((isChannel and not castIsEmpowered) and 1 or 0)
+  -- Initial fill value respects reverseFill: channels normally start full, casts start empty.
+  local startsAtFull = (isChannel and not castIsEmpowered)
+  if cfg.reverseFill then startsAtFull = not startsAtFull end
+  mainFrame.fillBar:SetValue(startsAtFull and 1 or 0)
 
   -- Initial timer text
   if cfg.showTimer then
@@ -1073,9 +1083,10 @@ elseif event == "UNIT_SPELLCAST_CHANNEL_START"
   elseif event == "UNIT_SPELLCAST_STOP"
       or event == "UNIT_SPELLCAST_FAILED"
       or event == "UNIT_SPELLCAST_INTERRUPTED" then
-    -- SPELLCAST_STOP fires during the GCD handshake when re-casting a channeled spell while
-    -- it is still active. Ignore it — CHANNEL_STOP / EMPOWER_STOP own the actual end.
-    if event == "UNIT_SPELLCAST_STOP" and (castIsChannel or castIsEmpowered) then return end
+    -- During an active channel/empower these events fire for GCD rejections (pressing the
+    -- ability within the GCD window) or other queued spells — not for the channel itself.
+    -- CHANNEL_STOP / EMPOWER_STOP own the actual end; ignore everything else here.
+    if castIsChannel or castIsEmpowered then return end
     StopCast()
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -1085,15 +1096,9 @@ elseif event == "UNIT_SPELLCAST_CHANNEL_START"
 
   elseif event == "UNIT_SPELLCAST_CHANNEL_STOP"
       or event == "UNIT_SPELLCAST_EMPOWER_STOP" then
-    -- Stale guard: a newer CHANNEL_START already claimed ownership, ignore this stop.
-    if castCurrentGUID and castGUID ~= castCurrentGUID then
-      CastDebug("CHANNEL_STOP ignored: stale GUID " .. tostring(castGUID))
-      return
-    end
-    -- Keep bar visible. CastOnUpdate will call StopCast once 0.35 s pass with no new
-    -- CHANNEL_START — which means it was a genuine end, not a spam re-cast.
     castChannelEnded = true
     channelStopTime  = GetTime()
+    CastDebug("CHANNEL_STOPPED FOR" .. tostring(castGUID))
   end
 end)
 

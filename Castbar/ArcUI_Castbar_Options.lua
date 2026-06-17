@@ -636,6 +636,15 @@ function ns.CastbarOptions.GetOptionsTable()
         set   = function(_, v) local c = GetCastbarDB(); if c then c.hideChannels = v end end,
       },
 
+      reverseFill = {
+        type  = "toggle",
+        name  = "Reverse Fill",
+        desc  = "Invert fill direction: casts drain right-to-left; channels fill left-to-right.",
+        order = 73,
+        get   = function() local c = GetCastbarDB(); return c and c.reverseFill end,
+        set   = function(_, v) local c = GetCastbarDB(); if c then c.reverseFill = v end end,
+      },
+
       -- ── Frame Strata ───────────────────────────────────────────────
       strataHeader = { type = "header", name = "Frame Strata", order = 80 },
 
