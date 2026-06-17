@@ -586,12 +586,39 @@ ns.DB_DEFAULTS = {
       hideOutOfCombat = false,
       hideChannels = false,
       empowerSegmentColorsEnabled = false,
+      empowerMaxStages = 4,
       empowerSegmentColors = {
         [1] = {r=0.6, g=0.2, b=1.0, a=1},
         [2] = {r=0.9, g=0.1, b=0.6, a=1},
         [3] = {r=1.0, g=0.3, b=0.1, a=1},
         [4] = {r=1.0, g=0.7, b=0.1, a=1},
+        [5] = {r=0.1, g=0.9, b=0.3, a=1},
+        [6] = {r=0.1, g=0.7, b=1.0, a=1},
+        [7] = {r=1.0, g=1.0, b=0.2, a=1},
+        [8] = {r=0.8, g=0.8, b=0.8, a=1},
       },
+      -- Uninterruptible cast styling
+      uninterruptibleEnabled = false,
+      uninterruptibleColor = {r=0.5, g=0.5, b=0.5, a=1},
+      uninterruptibleBorderColor = {r=0.3, g=0.3, b=0.5, a=1},
+      -- Channel tick marks
+      tickMarksEnabled = false,
+      tickMarksColor = {r=1, g=1, b=1, a=0.6},
+      tickMarksThickness = 2,
+      tickMarksHeightFraction = 1.0,
+      -- Per-spell appearance overrides: array of {spellID, barColorEnabled, barColor, textureOverrideEnabled, texture, tickCount}
+      spellOverrides = {},
+      -- Anchor to CDM group
+      anchorToGroup = false,
+      anchorGroupName = "",
+      anchorPoint = "BOTTOM",
+      anchorOffsetX = 0,
+      anchorOffsetY = -2,
+      matchGroupWidth = false,
+      matchSlotsOnly = false,
+      matchWidthAdjust = 0,
+      -- Default tick count for all channels (0 = disabled; per-spell override takes precedence)
+      tickMarksDefaultCount = 0,
       presets = {},
     },
 

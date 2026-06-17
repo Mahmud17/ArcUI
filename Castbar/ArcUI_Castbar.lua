@@ -34,7 +34,12 @@ local castStartTime = 0
 local castEndTime = 0
 local castPreviewActive = false
 local castTimingRefined = false
-
+local castActiveSpellID    = 0     -- spellID of current cast (for override re-apply on appearance change)
+local castNotInterruptible = false -- true when the current cast cannot be interrupted
+local activeTicks = 0              -- number of tick dividers currently shown (0 = none)
+local castCurrentGUID  = nil   -- GUID from the CHANNEL/EMPOWER_START that opened the current bar
+local castChannelEnded = false -- true between CHANNEL_STOP and the next CHANNEL_START (hold window)
+local channelStopTime  = 0     -- GetTime() when CHANNEL_STOP fired (drives the 0.35 s hold)
 -- ===================================================================
 -- DEBUG
 -- Toggle with /arccastdebug
@@ -95,8 +100,9 @@ local function CreateCastbarFrames()
   frame.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
   -- Segment bars for empowered casts — one StatusBar per stage, fills with its own color
+  -- Pool of 8 supports up to empowerMaxStages = 8; unused bars stay hidden.
   frame.stageSegBars = {}
-  for i = 1, 4 do
+  for i = 1, 8 do
     local sb = CreateFrame("StatusBar", nil, frame)
     sb:SetMinMaxValues(0, 1)
     sb:SetValue(0)
@@ -106,6 +112,19 @@ local function CreateCastbarFrames()
     sb:EnableMouse(false)
     sb:Hide()
     frame.stageSegBars[i] = sb
+  end
+
+  -- Tick mark overlay for channeled spells (16-divider pool covers any realistic tick count)
+  frame.tickOverlay = CreateFrame("Frame", nil, frame)
+  frame.tickOverlay:SetAllPoints()
+  frame.tickOverlay:SetFrameLevel(frame:GetFrameLevel() + 5)
+  frame.tickPool = {}
+  for i = 1, 16 do
+    local t = frame.tickOverlay:CreateTexture(nil, "OVERLAY")
+    t:SetSnapToPixelGrid(false)
+    t:SetTexelSnappingBias(0)
+    t:Hide()
+    frame.tickPool[i] = t
   end
 
   -- Blue "DRAG" overlay shown when drag mode is active (child of frame so it follows during move)
@@ -269,13 +288,101 @@ local function GetOrCreateFrames()
 end
 
 -- ===================================================================
+-- SPELL OVERRIDE & DISPLAY HELPERS
+-- ===================================================================
+local function GetSpellOverride(spellID, cfg)
+  if not cfg or not cfg.spellOverrides or not spellID or spellID == 0 then return nil end
+  for _, ov in ipairs(cfg.spellOverrides) do
+    if ov.spellID == spellID then return ov end
+  end
+  return nil
+end
+
+-- Returns: fillColor {r,g,b,a}, overrideTexPath (or nil), borderColorOverride (or nil)
+-- Priority: base type → spell override → uninterruptible
+local function ResolveActiveDisplay(cfg, spellID, isChannel, isEmpowered, notInterruptible)
+  local color
+  if isEmpowered then
+    color = cfg.empowerColor or {r=0.6, g=0.2, b=1, a=1}
+  elseif isChannel then
+    color = cfg.channelColor or {r=0.2, g=1, b=0.4, a=1}
+  else
+    color = cfg.barColor or {r=0.2, g=0.8, b=1, a=1}
+  end
+
+  local overrideTex = nil
+  local borderOvr   = nil
+  local override = GetSpellOverride(spellID, cfg)
+  if override then
+    if override.barColorEnabled and override.barColor then
+      color = override.barColor
+    end
+    if override.textureOverrideEnabled and override.texture and override.texture ~= "" then
+      overrideTex = (LSM and LSM:Fetch("statusbar", override.texture)) or nil
+    end
+  end
+
+  if notInterruptible and cfg.uninterruptibleEnabled then
+    if not (override and override.barColorEnabled) then
+      color = cfg.uninterruptibleColor or color
+    end
+    if cfg.showBorder and cfg.uninterruptibleBorderColor then
+      borderOvr = cfg.uninterruptibleBorderColor
+    end
+  end
+
+  return color, overrideTex, borderOvr
+end
+
+-- ===================================================================
+-- TICK MARKS
+-- ===================================================================
+local function PlaceTickMarks(count)
+  if not castFrameObj or not castFrameObj.tickPool then return end
+  activeTicks = count or 0
+  local cfg   = GetCastbarDB()
+  local pool  = castFrameObj.tickPool
+  local barW  = castFrameObj:GetWidth()
+  local barH  = castFrameObj:GetHeight()
+  local color = cfg and cfg.tickMarksColor or {r=1, g=1, b=1, a=0.6}
+  local thick = math.max(1, PixelSize(cfg and cfg.tickMarksThickness or 2))
+  local hFrac = cfg and cfg.tickMarksHeightFraction or 1.0
+  local tickH = math.max(1, PixelSize(barH * hFrac))
+  local yOff  = PixelSize((barH - tickH) / 2)
+  local divs  = count - 1  -- N ticks → N-1 dividers between them
+
+  for i = 1, #pool do
+    local t = pool[i]
+    if i <= divs then
+      local frac = i / count
+      local xPos = PixelSize(frac * barW) - math.floor(thick / 2)
+      t:ClearAllPoints()
+      t:SetPoint("TOPLEFT", castFrameObj, "TOPLEFT", xPos, -yOff)
+      t:SetSize(thick, tickH)
+      t:SetColorTexture(color.r, color.g, color.b, color.a or 0.6)
+      t:Show()
+    else
+      t:Hide()
+    end
+  end
+end
+ns.Castbar.PlaceTickMarks = PlaceTickMarks
+
+local function HideTickMarks()
+  activeTicks = 0
+  if not castFrameObj or not castFrameObj.tickPool then return end
+  for _, t in ipairs(castFrameObj.tickPool) do t:Hide() end
+end
+ns.Castbar.HideTickMarks = HideTickMarks
+
+-- ===================================================================
 -- BORDER DRAWING
 -- ===================================================================
-local function ApplyBorder(mainFrame, cfg)
+local function ApplyBorder(mainFrame, cfg, borderColorOverride)
   local bo = mainFrame.borderOverlay
   if cfg.showBorder then
     local bt = PixelUtil.GetNearestPixelSize(cfg.drawnBorderThickness or 2, mainFrame:GetEffectiveScale(), 1)
-    local bc = cfg.borderColor or {r=0, g=0, b=0, a=1}
+    local bc = borderColorOverride or cfg.borderColor or {r=0, g=0, b=0, a=1}
 
     for _, t in pairs({bo.top, bo.bottom, bo.left, bo.right}) do
       t:SetSnapToPixelGrid(true)
@@ -338,10 +445,37 @@ function ns.Castbar.ApplyAppearance()
   mainFrame:SetSize(w, h)
   textFrame:SetSize(w, h)
 
-  -- Position
-  local pos = cfg.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=-100}
-  mainFrame:ClearAllPoints()
-  mainFrame:SetPoint(pos.point or "CENTER", UIParent, pos.relPoint or "CENTER", pos.x or 0, pos.y or -100)
+  -- Position: anchor to a CDM group if configured, otherwise use the saved free position
+  local _anchorDone = false
+  local BGA = ns.BarGroupAlign
+  if cfg.anchorToGroup and cfg.anchorGroupName and cfg.anchorGroupName ~= "" and BGA then
+    local group = ns.CDMGroups and ns.CDMGroups.groups and ns.CDMGroups.groups[cfg.anchorGroupName]
+    if group and group.container then
+      local barH = h  -- already pixel-snapped above
+      local resolvedW = BGA.ApplySizeAndAnchor(
+        mainFrame,
+        cfg.anchorGroupName,
+        cfg.anchorPoint or "BOTTOM",
+        barH,
+        cfg.anchorOffsetX or 0,
+        cfg.anchorOffsetY or -2,
+        cfg.matchGroupWidth or false,
+        cfg.matchSlotsOnly or false,
+        false,                    -- isFragVertical (castbar is always horizontal)
+        cfg.matchWidthAdjust or 0,
+        false                     -- needsSwap
+      )
+      if resolvedW then
+        textFrame:SetSize(resolvedW, barH)
+      end
+      _anchorDone = true
+    end
+  end
+  if not _anchorDone then
+    local pos = cfg.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=-100}
+    mainFrame:ClearAllPoints()
+    mainFrame:SetPoint(pos.point or "CENTER", UIParent, pos.relPoint or "CENTER", pos.x or 0, pos.y or -100)
+  end
   textFrame:ClearAllPoints()
   textFrame:SetPoint("CENTER", mainFrame, "CENTER", 0, 0)
 
@@ -371,8 +505,10 @@ function ns.Castbar.ApplyAppearance()
     mainFrame.bg:Hide()
   end
 
-  -- Border
-  ApplyBorder(mainFrame, cfg)
+  -- Border (use uninterruptible override colour when a non-interruptible cast is active)
+  local _activeBorderOvr = (castActive and castNotInterruptible
+    and cfg.uninterruptibleEnabled and cfg.uninterruptibleBorderColor) or nil
+  ApplyBorder(mainFrame, cfg, _activeBorderOvr)
 
   -- Texture for fill bar
   local texPath = "Interface\\TargetingFrame\\UI-StatusBar"
@@ -382,6 +518,14 @@ function ns.Castbar.ApplyAppearance()
   mainFrame.fillBar:SetStatusBarTexture(texPath)
   if mainFrame.stageSegBars then
     for _, sb in ipairs(mainFrame.stageSegBars) do sb:SetStatusBarTexture(texPath) end
+  end
+
+  -- Re-apply active cast overrides so option changes don't clobber live styling
+  if castActive then
+    local color, overrideTex = ResolveActiveDisplay(cfg, castActiveSpellID, castIsChannel, castIsEmpowered, castNotInterruptible)
+    mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
+    if overrideTex then mainFrame.fillBar:SetStatusBarTexture(overrideTex) end
+    if activeTicks > 0 then PlaceTickMarks(activeTicks) end
   end
 
   -- Icon
@@ -422,7 +566,7 @@ end
 local function HideEmpowerVisuals()
   if not castFrameObj then return end
   if castFrameObj.stageSegBars then
-    for i = 1, 4 do
+    for i = 1, 8 do
       if castFrameObj.stageSegBars[i] then castFrameObj.stageSegBars[i]:Hide() end
     end
   end
@@ -440,8 +584,9 @@ local function PlaceSegmentBars()
   local nStage = castEmpowerNumStages
   local props  = castEmpowerStageProps
   if castPreviewActive and nStage == 0 then
-    nStage = 4
-    props  = {0.25, 0.5, 0.75}
+    nStage = (cfg and cfg.empowerMaxStages) or 4
+    props  = {}
+    for i = 1, nStage - 1 do props[i] = i / nStage end
   end
   local useSegs = cfg and cfg.empowerSegmentColorsEnabled and nStage > 0
 
@@ -452,7 +597,7 @@ local function PlaceSegmentBars()
     castFrameObj.fillBar:Show()
   end
 
-  for i = 1, 4 do
+  for i = 1, 8 do
     local sb = segs and segs[i]
     if sb then
       if useSegs and i <= nStage then
@@ -476,13 +621,21 @@ local function PlaceSegmentBars()
 end
 ns.Castbar.RefreshSegmentBars = PlaceSegmentBars
 
+-- Forward declaration: StopCast is defined after CastOnUpdate but called from within it.
+local StopCast
+
 -- ===================================================================
 -- ONUPDATE (only runs during an active cast)
 -- ===================================================================
 local function CastOnUpdate(self, elapsed)
   local cfg = GetCastbarDB()
-  if not cfg then return end
-
+    if not cfg then return end
+    if castChannelEnded and castIsChannel and not castIsEmpowered then
+      if (GetTime() - channelStopTime) > 0.35 then
+          StopCast()
+          return
+      end
+  end
   -- Regular channels: refine timing on each tick until we get valid server timestamps.
   if castIsChannel and not castIsEmpowered and not castTimingRefined then
     local name, _, _, st, et = UnitChannelInfo("player")
@@ -562,7 +715,7 @@ end
 -- SHOW / STOP CAST
 -- ===================================================================
 local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterruptible, isEmpowered, numStages, stageProps)
-  local cfg = GetCastbarDB()
+    local cfg = GetCastbarDB()
   if not cfg or not cfg.enabled then
     CastDebug("ShowCast blocked: castbar disabled (spellID=" .. tostring(spellID) .. ")")
     return
@@ -586,8 +739,11 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
   castActive            = true
   castPreviewActive     = false
   castTimingRefined     = false
+  castChannelEnded      = false
   castIsChannel         = isChannel or false
   castIsEmpowered       = isEmpowered or false
+  castActiveSpellID     = spellID or 0
+  castNotInterruptible  = notInterruptible or false
   castEmpowerNumStages  = numStages or 0
   castEmpowerStageProps = stageProps or {}
   castStartTime         = (startTimeMS or 0) / 1000
@@ -618,16 +774,11 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
     textFrame.nameText:SetText("")
   end
 
-  -- Bar color: empowered > channel > cast
-  local color
-  if castIsEmpowered then
-    color = cfg.empowerColor or {r=0.6, g=0.2, b=1, a=1}
-  elseif isChannel then
-    color = cfg.channelColor or {r=0.2, g=1, b=0.4, a=1}
-  else
-    color = cfg.barColor or {r=0.2, g=0.8, b=1, a=1}
-  end
+  -- Bar color: base type → spell override → uninterruptible
+  local color, overrideTex, borderOvr = ResolveActiveDisplay(cfg, spellID, isChannel, isEmpowered, notInterruptible)
   mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
+  if overrideTex then mainFrame.fillBar:SetStatusBarTexture(overrideTex) end
+  ApplyBorder(mainFrame, cfg, borderOvr)
 
   -- Initial fill: regular channels start full (drain R→L); casts and empowered start empty (fill L→R)
   mainFrame.fillBar:SetValue((isChannel and not castIsEmpowered) and 1 or 0)
@@ -649,11 +800,26 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
   else
     HideEmpowerVisuals()
   end
+  -- Tick marks: per-spell count takes priority; fall back to the global default count
+  if castIsChannel and not castIsEmpowered and cfg.tickMarksEnabled then
+    local ov = GetSpellOverride(spellID, cfg)
+    local tc = (ov and ov.tickCount and ov.tickCount > 0 and ov.tickCount)
+            or (cfg.tickMarksDefaultCount and cfg.tickMarksDefaultCount > 0 and cfg.tickMarksDefaultCount)
+            or 0
+    if tc > 0 then PlaceTickMarks(tc) else HideTickMarks() end
+  else
+    HideTickMarks()
+  end
   mainFrame:SetScript("OnUpdate", CastOnUpdate)
 end
 
-local function StopCast()
-  castActive = false
+StopCast = function()
+  castActive           = false
+  castChannelEnded     = false
+  castActiveSpellID    = 0
+  castNotInterruptible = false
+  castCurrentGUID      = nil
+  HideTickMarks()
   HideEmpowerVisuals()
   castIsEmpowered      = false
   castEmpowerNumStages  = 0
@@ -703,7 +869,7 @@ local function ShowPreview()
   textFrame.timerText:SetText(cfg.showTimer and "1.2" or "")
 
   local cfg2 = GetCastbarDB()
-  if mainFrame.dragToggleBtn and cfg2 and cfg2.barMovable ~= false then
+  if mainFrame.dragToggleBtn and cfg2 and cfg2.barMovable ~= false and not cfg2.anchorToGroup then
     mainFrame.dragToggleBtn:Show()
   end
   mainFrame:Show()
@@ -796,63 +962,70 @@ castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellI
     end
 
 elseif event == "UNIT_SPELLCAST_CHANNEL_START"
-      or event == "UNIT_SPELLCAST_EMPOWER_START" then
+    or event == "UNIT_SPELLCAST_EMPOWER_START" then
 
     local isEmpowerEvent = (event == "UNIT_SPELLCAST_EMPOWER_START")
 
-    local function TryStartCast(savedSpellID)
-      local name, _, _, startTimeMS, endTimeMS, _, _, chanSpellID, _, numStages = UnitChannelInfo("player")
-      CastDebug("TryStartCast: event=" .. event
-        .. " name=" .. tostring(name)
-        .. " chanSpellID=" .. tostring(chanSpellID)
-        .. " savedSpellID=" .. tostring(savedSpellID)
-        .. " numStages=" .. tostring(numStages)
-        .. " startMS=" .. tostring(startTimeMS)
-        .. " endMS=" .. tostring(endTimeMS))
-      if not name then
-        CastDebug("TryStartCast: UnitChannelInfo returned nil — will defer")
-        return false
-      end
+    -- hard reset stale stop
+    castChannelEnded = false
+    channelStopTime = 0
 
-      local useSpellID   = chanSpellID or savedSpellID
-      -- Treat as empowered if UnitChannelInfo says so OR if the event was EMPOWER_START
-      local isEmpoweredCast = isEmpowerEvent or (numStages and numStages > 0)
-      CastDebug("TryStartCast: isEmpowerEvent=" .. tostring(isEmpowerEvent)
-        .. " isEmpoweredCast=" .. tostring(isEmpoweredCast))
+    local savedGUID = castGUID
+    castCurrentGUID = castGUID or spellID
 
-      if isEmpoweredCast then
-        local stageCount = (numStages and numStages > 0) and numStages or 4
-        local ha = (GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player")) or 0
-        local totalEndMS = endTimeMS + ha
-        -- Equal-distribution stage boundaries (safe: avoids GetUnitEmpowerStageDuration secrets)
-        local stageProps = {}
-        for i = 1, stageCount - 1 do stageProps[i] = i / stageCount end
-        -- Use placeholder timing if server timestamps not ready yet; CastOnUpdate refines.
-        local useStart = (startTimeMS and startTimeMS > 0) and startTimeMS or (GetTime() * 1000)
-        local useEnd   = ((totalEndMS - useStart) > 0)    and totalEndMS  or (useStart + 5000)
-        ShowCast(useSpellID, useStart, useEnd, false, false, true, stageCount, stageProps)
-      else
-        ShowCast(useSpellID, startTimeMS, endTimeMS, true, false)
-      end
-      return true
+    -- FAST PATH: same spell spam — keep bar live with no visual reset.
+    -- Unconditional: UnitChannelInfo may be nil here (Blizzard race); CastOnUpdate's
+    -- timing-refinement loop will pick up the new timestamps on the next frame.
+    if castActive
+        and castIsChannel
+        and not castIsEmpowered
+        and not isEmpowerEvent
+        and castActiveSpellID == spellID then
+        castTimingRefined = false
+        CastDebug("CHANNEL_CONTINUE same spell")
+        return
     end
 
-    if not TryStartCast(spellID) then
-      -- UnitChannelInfo not yet populated (race condition at event fire).
-      -- Defer one frame; if the cast is still active UnitChannelInfo will have data.
-      -- Never fall back to isChannel=true for EMPOWER events (would be hidden by hideChannels).
-      CastDebug("TryStartCast returned nil — scheduling 1-frame defer for spellID=" .. tostring(spellID))
-      local savedSpellID = spellID
-      C_Timer.After(0, function()
-        if castActive then
-          CastDebug("Deferred TryStartCast: cast already active, skipping")
-          return
+    local function TryStart()
+        local name, _, _, st, et, _, _, chanSpellID, _, stages = UnitChannelInfo("player")
+        if not name then return false end
+
+        local useSpellID = chanSpellID or spellID
+        local isEmp = isEmpowerEvent or (stages and stages > 0)
+
+        if isEmp then
+            local stageCount = (stages and stages > 0) and stages or 4
+            local ha = (GetUnitEmpowerHoldAtMaxTime and GetUnitEmpowerHoldAtMaxTime("player")) or 0
+
+            local totalEnd = et + ha
+            local start = (st and st > 0) and st or (GetTime() * 1000)
+
+            local props = {}
+            for i = 1, stageCount - 1 do
+                props[i] = i / stageCount
+            end
+
+            ShowCast(useSpellID, start, totalEnd, false, false, true, stageCount, props)
+        else
+            ShowCast(useSpellID, st, et, true, false)
         end
-        local n = select(1, UnitChannelInfo("player"))
-        CastDebug("Deferred TryStartCast: UnitChannelInfo name=" .. tostring(n))
-        if n then TryStartCast(savedSpellID) end
-      end)
+
+        return true
     end
+
+    -- immediate try
+    if TryStart() then return end
+
+    -- retry (fixes Blizzard nil race)
+    local function retry(n)
+        C_Timer.After(0.05, function()
+            if castCurrentGUID ~= savedGUID then return end
+            if TryStart() then return end
+            if n > 1 then retry(n - 1) end
+        end)
+    end
+
+    retry(3)
 
   elseif event == "UNIT_SPELLCAST_EMPOWER_UPDATE" then
     -- Catch-all: if EMPOWER_START was missed entirely (nil race resolved too late),
@@ -888,11 +1061,21 @@ elseif event == "UNIT_SPELLCAST_CHANNEL_START"
         castStartTime = (startTimeMS or 0) / 1000
         castEndTime   = (endTimeMS   or 0) / 1000
       end
+    -- Catch-all: CHANNEL_START nil-raced and all retries resolved before UnitChannelInfo populated
+    elseif not castActive then
+      local name, _, _, startTimeMS, endTimeMS, _, _, chanSpellID = UnitChannelInfo("player")
+      if name then
+        CastDebug("CHANNEL_UPDATE catch-all: spellID=" .. tostring(chanSpellID or spellID))
+        ShowCast(chanSpellID or spellID, startTimeMS, endTimeMS, true, false)
+      end
     end
 
   elseif event == "UNIT_SPELLCAST_STOP"
       or event == "UNIT_SPELLCAST_FAILED"
       or event == "UNIT_SPELLCAST_INTERRUPTED" then
+    -- SPELLCAST_STOP fires during the GCD handshake when re-casting a channeled spell while
+    -- it is still active. Ignore it — CHANNEL_STOP / EMPOWER_STOP own the actual end.
+    if event == "UNIT_SPELLCAST_STOP" and (castIsChannel or castIsEmpowered) then return end
     StopCast()
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -902,7 +1085,15 @@ elseif event == "UNIT_SPELLCAST_CHANNEL_START"
 
   elseif event == "UNIT_SPELLCAST_CHANNEL_STOP"
       or event == "UNIT_SPELLCAST_EMPOWER_STOP" then
-    StopCast()
+    -- Stale guard: a newer CHANNEL_START already claimed ownership, ignore this stop.
+    if castCurrentGUID and castGUID ~= castCurrentGUID then
+      CastDebug("CHANNEL_STOP ignored: stale GUID " .. tostring(castGUID))
+      return
+    end
+    -- Keep bar visible. CastOnUpdate will call StopCast once 0.35 s pass with no new
+    -- CHANNEL_START — which means it was a genuine end, not a spam re-cast.
+    castChannelEnded = true
+    channelStopTime  = GetTime()
   end
 end)
 
@@ -924,6 +1115,12 @@ SlashCmdList["ARCCASTDEBUG"] = function()
     print("  castIsChannel=" .. tostring(castIsChannel))
     print("  castIsEmpowered=" .. tostring(castIsEmpowered))
     print("  castEmpowerNumStages=" .. tostring(castEmpowerNumStages))
+    if castActive and castActiveSpellID > 0 then
+      local info = C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(castActiveSpellID)
+      print("  |cffffd100Active spell:|r spellID=" .. castActiveSpellID
+        .. " name=" .. tostring(info and info.name or "?")
+        .. " notInterruptible=" .. tostring(castNotInterruptible))
+    end
     print("  InCombat=" .. tostring(InCombatLockdown()))
     local n, _, _, st, et, _, _, sid, _, ns2 = UnitChannelInfo("player")
     if n then
@@ -932,8 +1129,8 @@ SlashCmdList["ARCCASTDEBUG"] = function()
     else
       print("  UnitChannelInfo: nil (no active channel/empower)")
     end
-    local cn = select(1, UnitCastingInfo("player"))
-    print("  UnitCastingInfo: name=" .. tostring(cn))
+    local cn, _, _, _, _, _, _, cni = UnitCastingInfo("player")
+    print("  UnitCastingInfo: name=" .. tostring(cn) .. " notInterruptible=" .. tostring(cni))
   end
 end
 
