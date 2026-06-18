@@ -74,7 +74,7 @@ local RebuildUnifiedIconCache
 -- Define which fields belong to each section for per-icon indicator
 -- ===================================================================
 local SECTION_FIELDS = {
-  iconAppearance = { "scale", "width", "height", "aspectRatio", "zoom", "padding", "useGroupScale", "shadowSize", "keepBright", "keepBrightAllowDesat", "customIconID", "debuffBorder.enabled", "pandemicBorder.enabled" },
+  iconAppearance = { "scale", "width", "height", "aspectRatio", "zoom", "padding", "useGroupScale", "shadowSize", "keepBright", "keepBrightAllowDesat", "customIconID", "debuffBorder.enabled", "pandemicBorder.enabled", "pandemicBorder.color", "pandemicTint.enabled", "pandemicTint.color" },
   position = { "position" },
   -- Ready State / Aura Active - all actual stored fields
   activeState = { 
@@ -3154,12 +3154,57 @@ function ns.GetCDMAuraIconsOptionsTable()
     },
     showPandemicBorder = {
       type = "toggle", name = "Pandemic Glow",
-      desc = "Shows the red pandemic glow when aura is at 30% remaining (default: hidden, use Alert Events instead).\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it. This will be addressed in a future update.",
+      desc = "Shows a glow when the aura is at 30% remaining (default: hidden, use Alert Events instead).\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it. This will be addressed in a future update.",
       get = function()
         return GetAuraBoolSetting(function(c) return c.pandemicBorder and c.pandemicBorder.enabled end, function() local c = GetAuraCfg(); return c and c.pandemicBorder and c.pandemicBorder.enabled end)
       end,
       set = function(_, v) ApplyAuraSetting(function(c) if not c.pandemicBorder then c.pandemicBorder = {} end; c.pandemicBorder.enabled = v end) end,
       order = 107.53, width = 0.8, hidden = HideAuraIconAppearance,
+    },
+    pandemicBorderColor = {
+      type = "color", name = "Glow Color", hasAlpha = false,
+      desc = "Color of the pandemic glow border (default: red).",
+      get = function()
+        local c = GetAuraCfg()
+        local col = c and c.pandemicBorder and c.pandemicBorder.color
+        if col then return col.r or 1, col.g or 0, col.b or 0 end
+        return 1, 0, 0
+      end,
+      set = function(_, r, g, b)
+        ApplyAuraSetting(function(c) if not c.pandemicBorder then c.pandemicBorder = {} end; c.pandemicBorder.color = {r=r,g=g,b=b,a=1} end)
+      end,
+      hidden = function()
+        if HideAuraIconAppearance() then return true end
+        local c = GetAuraCfg(); return not (c and c.pandemicBorder and c.pandemicBorder.enabled)
+      end,
+      order = 107.531, width = 0.55,
+    },
+    pandemicTintEnabled = {
+      type = "toggle", name = "Pandemic Icon Tint",
+      desc = "Tint the icon a custom color when it enters the pandemic window (30% remaining).",
+      get = function()
+        return GetAuraBoolSetting(function(c) return c.pandemicTint and c.pandemicTint.enabled end, function() local c = GetAuraCfg(); return c and c.pandemicTint and c.pandemicTint.enabled end)
+      end,
+      set = function(_, v) ApplyAuraSetting(function(c) if not c.pandemicTint then c.pandemicTint = {} end; c.pandemicTint.enabled = v end) end,
+      order = 107.54, width = 0.8, hidden = HideAuraIconAppearance,
+    },
+    pandemicTintColor = {
+      type = "color", name = "Tint Color", hasAlpha = false,
+      desc = "Color applied to the icon texture when it is in the pandemic window.",
+      get = function()
+        local c = GetAuraCfg()
+        local col = c and c.pandemicTint and c.pandemicTint.color
+        if col then return col.r or 1, col.g or 0.15, col.b or 0.15 end
+        return 1, 0.15, 0.15
+      end,
+      set = function(_, r, g, b)
+        ApplyAuraSetting(function(c) if not c.pandemicTint then c.pandemicTint = {} end; c.pandemicTint.color = {r=r,g=g,b=b,a=1} end)
+      end,
+      hidden = function()
+        if HideAuraIconAppearance() then return true end
+        local c = GetAuraCfg(); return not (c and c.pandemicTint and c.pandemicTint.enabled)
+      end,
+      order = 107.55, width = 0.55,
     },
     resetIconAppearance = {
       type = "execute",
@@ -6478,12 +6523,57 @@ function ns.GetCDMCooldownIconsOptionsTable()
     },
     showPandemicBorder = {
       type = "toggle", name = "Pandemic Glow",
-      desc = "Shows the red pandemic glow when cooldown is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it.",
+      desc = "Shows a glow when the cooldown is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it.",
       get = function()
         return GetCooldownBoolSetting(function(c) return c.pandemicBorder and c.pandemicBorder.enabled end, function() local c = GetCooldownCfg(); return c and c.pandemicBorder and c.pandemicBorder.enabled end)
       end,
       set = function(_, v) ApplySharedCooldownSetting(function(c) if not c.pandemicBorder then c.pandemicBorder = {} end; c.pandemicBorder.enabled = v end) end,
-      order = 107.52, width = 0.85, hidden = HideCooldownIconAppearance,
+      order = 107.52, width = 0.8, hidden = HideCooldownIconAppearance,
+    },
+    pandemicCooldownBorderColor = {
+      type = "color", name = "Glow Color", hasAlpha = false,
+      desc = "Color of the pandemic glow border (default: red).",
+      get = function()
+        local c = GetCooldownCfg()
+        local col = c and c.pandemicBorder and c.pandemicBorder.color
+        if col then return col.r or 1, col.g or 0, col.b or 0 end
+        return 1, 0, 0
+      end,
+      set = function(_, r, g, b)
+        ApplySharedCooldownSetting(function(c) if not c.pandemicBorder then c.pandemicBorder = {} end; c.pandemicBorder.color = {r=r,g=g,b=b,a=1} end)
+      end,
+      hidden = function()
+        if HideCooldownIconAppearance() then return true end
+        local c = GetCooldownCfg(); return not (c and c.pandemicBorder and c.pandemicBorder.enabled)
+      end,
+      order = 107.521, width = 0.55,
+    },
+    pandemicCooldownTintEnabled = {
+      type = "toggle", name = "Pandemic Icon Tint",
+      desc = "Tint the icon a custom color when it enters the pandemic window (30% remaining).",
+      get = function()
+        return GetCooldownBoolSetting(function(c) return c.pandemicTint and c.pandemicTint.enabled end, function() local c = GetCooldownCfg(); return c and c.pandemicTint and c.pandemicTint.enabled end)
+      end,
+      set = function(_, v) ApplySharedCooldownSetting(function(c) if not c.pandemicTint then c.pandemicTint = {} end; c.pandemicTint.enabled = v end) end,
+      order = 107.522, width = 0.8, hidden = HideCooldownIconAppearance,
+    },
+    pandemicCooldownTintColor = {
+      type = "color", name = "Tint Color", hasAlpha = false,
+      desc = "Color applied to the icon texture when in the pandemic window.",
+      get = function()
+        local c = GetCooldownCfg()
+        local col = c and c.pandemicTint and c.pandemicTint.color
+        if col then return col.r or 1, col.g or 0.15, col.b or 0.15 end
+        return 1, 0.15, 0.15
+      end,
+      set = function(_, r, g, b)
+        ApplySharedCooldownSetting(function(c) if not c.pandemicTint then c.pandemicTint = {} end; c.pandemicTint.color = {r=r,g=g,b=b,a=1} end)
+      end,
+      hidden = function()
+        if HideCooldownIconAppearance() then return true end
+        local c = GetCooldownCfg(); return not (c and c.pandemicTint and c.pandemicTint.enabled)
+      end,
+      order = 107.523, width = 0.55,
     },
     resetIconAppearance = {
       type = "execute",
@@ -10061,12 +10151,66 @@ function ns.GetCDMGlobalAuraDefaultsOptionsTable()
       },
       showPandemicBorder = {
         type = "toggle", name = "Pandemic Glow",
-        desc = "Show red pandemic glow when aura is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it. This will be addressed in a future update.",
+        desc = "Show a glow when the aura is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it. This will be addressed in a future update.",
         get = function() local g = GetAuraGlobalCfg(); return g.pandemicBorder and g.pandemicBorder.enabled end,
         set = function(_, v) ApplyAuraGlobalSetting("pandemicBorder.enabled", v); RefreshGlobalAuras() end,
         order = 13.6, width = 0.7, hidden = function() return collapsedGlobalAuraSections.iconAppearance end,
       },
-      
+      globalAuraPandemicBorderColor = {
+        type = "color", name = "Glow Color", hasAlpha = false,
+        desc = "Color of the pandemic glow border (default: red).",
+        get = function()
+          local g = GetAuraGlobalCfg()
+          local c = g.pandemicBorder and g.pandemicBorder.color
+          if c then return c.r or 1, c.g or 0, c.b or 0 end
+          return 1, 0, 0
+        end,
+        set = function(_, r, g, b)
+          local cfg = GetAuraGlobalCfg()
+          if not cfg.pandemicBorder then cfg.pandemicBorder = {} end
+          cfg.pandemicBorder.color = {r=r,g=g,b=b,a=1}
+          RefreshGlobalAuras()
+        end,
+        hidden = function()
+          if collapsedGlobalAuraSections.iconAppearance then return true end
+          local g = GetAuraGlobalCfg(); return not (g.pandemicBorder and g.pandemicBorder.enabled)
+        end,
+        order = 13.61, width = 0.55,
+      },
+      globalAuraPandemicTintEnabled = {
+        type = "toggle", name = "Pandemic Icon Tint",
+        desc = "Tint the icon a custom color when it enters the pandemic window.",
+        get = function() local g = GetAuraGlobalCfg(); return g.pandemicTint and g.pandemicTint.enabled end,
+        set = function(_, v)
+          local cfg = GetAuraGlobalCfg()
+          if not cfg.pandemicTint then cfg.pandemicTint = {} end
+          cfg.pandemicTint.enabled = v
+          RefreshGlobalAuras()
+        end,
+        order = 13.62, width = 0.8, hidden = function() return collapsedGlobalAuraSections.iconAppearance end,
+      },
+      globalAuraPandemicTintColor = {
+        type = "color", name = "Tint Color", hasAlpha = false,
+        desc = "Color applied to the icon texture when in the pandemic window.",
+        get = function()
+          local g = GetAuraGlobalCfg()
+          local c = g.pandemicTint and g.pandemicTint.color
+          if c then return c.r or 1, c.g or 0.15, c.b or 0.15 end
+          return 1, 0.15, 0.15
+        end,
+        set = function(_, r, g, b)
+          local cfg = GetAuraGlobalCfg()
+          if not cfg.pandemicTint then cfg.pandemicTint = {} end
+          cfg.pandemicTint.color = {r=r,g=g,b=b,a=1}
+          RefreshGlobalAuras()
+        end,
+        hidden = function()
+          if collapsedGlobalAuraSections.iconAppearance then return true end
+          local g = GetAuraGlobalCfg(); return not (g.pandemicTint and g.pandemicTint.enabled)
+        end,
+        order = 13.63, width = 0.55,
+      },
+
       -- ═══════════════════════════════════════════════════════════════════
       -- ACTIVE STATE
       -- ═══════════════════════════════════════════════════════════════════
@@ -11771,12 +11915,66 @@ function ns.GetCDMGlobalCooldownDefaultsOptionsTable()
       },
       showPandemicBorder = {
         type = "toggle", name = "Pandemic Glow",
-        desc = "Show red pandemic glow when cooldown is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it.",
+        desc = "Show a glow when the cooldown is at 30% remaining.\n\n|cff888888Note:|r If glow persists after disabling, /reload fixes it.",
         get = function() local g = GetCooldownGlobalCfg(); return g.pandemicBorder and g.pandemicBorder.enabled end,
         set = function(_, v) ApplyCooldownGlobalSetting("pandemicBorder.enabled", v); RefreshGlobalCooldowns() end,
-        order = 13.5, width = 0.85, hidden = function() return collapsedGlobalCooldownSections.iconAppearance end,
+        order = 13.5, width = 0.7, hidden = function() return collapsedGlobalCooldownSections.iconAppearance end,
       },
-      
+      globalCooldownPandemicBorderColor = {
+        type = "color", name = "Glow Color", hasAlpha = false,
+        desc = "Color of the pandemic glow border (default: red).",
+        get = function()
+          local g = GetCooldownGlobalCfg()
+          local c = g.pandemicBorder and g.pandemicBorder.color
+          if c then return c.r or 1, c.g or 0, c.b or 0 end
+          return 1, 0, 0
+        end,
+        set = function(_, r, g, b)
+          local cfg = GetCooldownGlobalCfg()
+          if not cfg.pandemicBorder then cfg.pandemicBorder = {} end
+          cfg.pandemicBorder.color = {r=r,g=g,b=b,a=1}
+          RefreshGlobalCooldowns()
+        end,
+        hidden = function()
+          if collapsedGlobalCooldownSections.iconAppearance then return true end
+          local g = GetCooldownGlobalCfg(); return not (g.pandemicBorder and g.pandemicBorder.enabled)
+        end,
+        order = 13.51, width = 0.55,
+      },
+      globalCooldownPandemicTintEnabled = {
+        type = "toggle", name = "Pandemic Icon Tint",
+        desc = "Tint the icon a custom color when it enters the pandemic window.",
+        get = function() local g = GetCooldownGlobalCfg(); return g.pandemicTint and g.pandemicTint.enabled end,
+        set = function(_, v)
+          local cfg = GetCooldownGlobalCfg()
+          if not cfg.pandemicTint then cfg.pandemicTint = {} end
+          cfg.pandemicTint.enabled = v
+          RefreshGlobalCooldowns()
+        end,
+        order = 13.52, width = 0.8, hidden = function() return collapsedGlobalCooldownSections.iconAppearance end,
+      },
+      globalCooldownPandemicTintColor = {
+        type = "color", name = "Tint Color", hasAlpha = false,
+        desc = "Color applied to the icon texture when in the pandemic window.",
+        get = function()
+          local g = GetCooldownGlobalCfg()
+          local c = g.pandemicTint and g.pandemicTint.color
+          if c then return c.r or 1, c.g or 0.15, c.b or 0.15 end
+          return 1, 0.15, 0.15
+        end,
+        set = function(_, r, g, b)
+          local cfg = GetCooldownGlobalCfg()
+          if not cfg.pandemicTint then cfg.pandemicTint = {} end
+          cfg.pandemicTint.color = {r=r,g=g,b=b,a=1}
+          RefreshGlobalCooldowns()
+        end,
+        hidden = function()
+          if collapsedGlobalCooldownSections.iconAppearance then return true end
+          local g = GetCooldownGlobalCfg(); return not (g.pandemicTint and g.pandemicTint.enabled)
+        end,
+        order = 13.53, width = 0.55,
+      },
+
       -- ═══════════════════════════════════════════════════════════════════
       -- READY STATE
       -- ═══════════════════════════════════════════════════════════════════

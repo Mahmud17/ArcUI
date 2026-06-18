@@ -1012,7 +1012,13 @@ local DEFAULT_ICON_SETTINGS = {
   -- Pandemic Border (red glow when aura is in pandemic window - 30% remaining)
   pandemicBorder = {
     enabled = false,  -- Show pandemic indicator (default hidden - we have custom alerts)
-    -- When enabled, border will be sized to match icon with zoom/padding
+    color   = {r=1, g=0, b=0, a=1},  -- Glow color (default CDM red)
+  },
+
+  -- Pandemic Tint: vertex-color the icon when inside the pandemic window
+  pandemicTint = {
+    enabled = false,
+    color   = {r=1, g=0.15, b=0.15, a=1},
   },
   
   -- Alert Events (triggered by CDM's TriggerAlertEvent)
@@ -2598,9 +2604,46 @@ ApplyIconStyle = function(frame, cdID)
     -- Zero timers, zero closures, zero allocations. Just a GetTime() stamp and a compare.
     local PANDEMIC_LINGER = 0.1  -- allow ~6 frames of Hide before killing (handles hitches)
 
+    -- Returns the icon texture for a CDM frame (same pattern as SpellUsability).
+    local function GetIconTexForFrame(f)
+      local t = f.Icon or f.icon
+      if t and not t.SetVertexColor and t.Icon then t = t.Icon end
+      return (t and t.SetVertexColor) and t or nil
+    end
+
+    -- Apply or clear the pandemic vertex tint.
+    -- active=true: tint the icon if pandemicTint.enabled; clear any stale tint otherwise.
+    -- active=false: unconditionally clear if the tint was previously applied.
+    local function ApplyPandemicTint(f, active)
+      if active then
+        local ptCfg = GetEffectiveIconSettingsForFrame(f)
+        local pt    = ptCfg and ptCfg.pandemicTint
+        if not pt or not pt.enabled then
+          if f._arcPandemicTintActive then
+            f._arcPandemicTintActive = nil
+            local tex = GetIconTexForFrame(f)
+            if tex then tex:SetVertexColor(1, 1, 1, 1) end
+          end
+          return
+        end
+        local tex = GetIconTexForFrame(f)
+        if not tex then return end
+        local c = pt.color or {r=1, g=0.15, b=0.15, a=1}
+        f._arcPandemicTintActive = true
+        tex:SetVertexColor(c.r or 1, c.g or 0.15, c.b or 0.15, 1)
+      else
+        if not f._arcPandemicTintActive then return end
+        f._arcPandemicTintActive    = nil
+        f._arcPandemicTintLastFire  = nil
+        local tex = GetIconTexForFrame(f)
+        if tex then tex:SetVertexColor(1, 1, 1, 1) end
+      end
+    end
+
     local function PandemicGlowKill(self)
       self._arcPandemicGlowActive = nil
       self._arcPandemicLastFire   = nil
+      ApplyPandemicTint(self, false)
       local pfCfgW = GetEffectiveIconSettingsForFrame(self)
       local aasFW  = pfCfgW and pfCfgW.auraActiveState
       local svFW   = pfCfgW and GetEffectiveStateVisuals(pfCfgW)
@@ -2618,9 +2661,24 @@ ApplyIconStyle = function(frame, cdID)
       local zm = self._arcZoom or 0
       if self._arcShowPandemic then
         ModuleEnableBorderFrame(pi, self, pad, zm, "pandemic")
+        -- Apply custom border color every tick (ShowPandemicStateFrame fires each frame while active)
+        local pbCfg = GetEffectiveIconSettingsForFrame(self)
+        local bc = pbCfg and pbCfg.pandemicBorder and pbCfg.pandemicBorder.color
+        if bc then
+          if pi.Border and pi.Border.Border then
+            pi.Border.Border:SetVertexColor(bc.r or 1, bc.g or 0, bc.b or 0, 1)
+          end
+          if pi.FX then
+            pi.FX:SetVertexColor(bc.r or 1, bc.g or 0, bc.b or 0, 1)
+          end
+        end
       else
         ModuleDisableBorderFrame(pi, "pandemic")
       end
+
+      -- Icon tint: applied every tick while inside the pandemic window (independent of glow)
+      ApplyPandemicTint(self, true)
+      self._arcPandemicTintLastFire = GetTime()
 
       local pfCfg = GetEffectiveIconSettingsForFrame(self)
       local aasF  = pfCfg and pfCfg.auraActiveState
@@ -2652,8 +2710,16 @@ ApplyIconStyle = function(frame, cdID)
     end)
 
     -- HidePandemicStateFrame fires every frame when window is closed.
-    -- Kill glow once enough time has passed since last ShowPandemicStateFrame.
+    -- Kill glow and tint once enough time has passed since last ShowPandemicStateFrame.
     hooksecurefunc(frame, "HidePandemicStateFrame", function(self)
+      -- Tint (independent path — no glowFollowPandemic required)
+      if self._arcPandemicTintActive then
+        local tLast = self._arcPandemicTintLastFire
+        if not tLast or (GetTime() - tLast) >= PANDEMIC_LINGER then
+          ApplyPandemicTint(self, false)
+        end
+      end
+      -- Glow
       if not self._arcPandemicGlowActive then return end
       local last = self._arcPandemicLastFire
       if last and (GetTime() - last) < PANDEMIC_LINGER then return end

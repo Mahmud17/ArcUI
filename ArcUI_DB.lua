@@ -372,6 +372,23 @@ ns.DB_DEFAULTS = {
           font = "Friz Quadrata TT",
           fontSize = 20,
           textColor = {r=1, g=1, b=1, a=1},
+          -- Text color thresholds: color the numeric text based on current resource value
+          textColorThresholdEnabled = false,
+          textColorThresholdFill = false,        -- true=fill (colors appear as value rises); false=drain (colors at low values)
+          textColorThresholdAsPercent = true,    -- true=percent (0-100), false=absolute
+          textColorThresholdBaseColor = {r=1, g=1, b=1, a=1},
+          textColorThreshold2Enabled = false,
+          textColorThreshold2Value = 15,
+          textColorThreshold2Color = {r=1, g=0.6, b=0.8, a=1},
+          textColorThreshold3Enabled = false,
+          textColorThreshold3Value = 30,
+          textColorThreshold3Color = {r=0.3, g=1, b=0.3, a=1},
+          textColorThreshold4Enabled = false,
+          textColorThreshold4Value = 90,
+          textColorThreshold4Color = {r=1, g=0.2, b=0.2, a=1},
+          textColorThreshold5Enabled = false,
+          textColorThreshold5Value = 95,
+          textColorThreshold5Color = {r=0.7, g=0, b=1, a=1},
           textAnchor = "OUTERTOP",
           textAnchorOffsetX = 0,
           textAnchorOffsetY = 0,

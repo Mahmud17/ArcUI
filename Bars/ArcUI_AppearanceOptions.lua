@@ -9315,6 +9315,254 @@ function ns.AppearanceOptions.GetOptionsTable()
           return not (cfg and cfg.display.showText and cfg.display.textColorByState)
         end
       },
+      textColorThresholdEnabled = {
+        type = "toggle",
+        name = "Text Color Thresholds",
+        desc = "Color the resource text based on the current value (e.g. white when low, green when spendable, red when near cap). Works alongside the bar color threshold system.",
+        get = function()
+          local cfg = GetSelectedConfig()
+          return cfg and cfg.display.textColorThresholdEnabled
+        end,
+        set = function(info, value)
+          local cfg = GetSelectedConfig()
+          if cfg then cfg.display.textColorThresholdEnabled = value; RefreshBar() end
+        end,
+        order = 72.5,
+        width = 1.3,
+        hidden = function()
+          if IsIconMode() or collapsedSections.stackText then return true end
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText)
+        end,
+      },
+      textColorThresholdFill = {
+        type = "toggle",
+        name = "Fill Direction",
+        desc = "Fill: threshold colors appear as the resource builds up (e.g. green appears once you reach 30). Drain (default): threshold colors appear at low values (like bar color thresholds).",
+        get = function()
+          local cfg = GetSelectedConfig()
+          return cfg and cfg.display.textColorThresholdFill
+        end,
+        set = function(info, value)
+          local cfg = GetSelectedConfig()
+          if cfg then cfg.display.textColorThresholdFill = value; RefreshBar() end
+        end,
+        order = 72.51,
+        width = 0.9,
+        hidden = function()
+          if IsIconMode() or collapsedSections.stackText then return true end
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThresholdAsPercent = {
+        type = "toggle",
+        name = "Use Percent",
+        desc = "Threshold values are percentages (0-100). Disable to enter absolute values (e.g. 90 Runic Power instead of 90%).",
+        get = function()
+          local cfg = GetSelectedConfig()
+          if cfg and cfg.display.textColorThresholdAsPercent == false then return false end
+          return true
+        end,
+        set = function(info, value)
+          local cfg = GetSelectedConfig()
+          if cfg then cfg.display.textColorThresholdAsPercent = value; RefreshBar() end
+        end,
+        order = 72.52,
+        width = 0.8,
+        hidden = function()
+          if IsIconMode() or collapsedSections.stackText then return true end
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThresholdBaseColor = {
+        type = "color",
+        name = "Base Color",
+        desc = "Text color when the resource is below the lowest enabled threshold (Fill mode) or above the highest threshold (Drain mode).",
+        hasAlpha = false,
+        get = function()
+          local cfg = GetSelectedConfig()
+          local c = cfg and cfg.display.textColorThresholdBaseColor or {r=1,g=1,b=1}
+          return c.r or 1, c.g or 1, c.b or 1
+        end,
+        set = function(info, r, g, b)
+          local cfg = GetSelectedConfig()
+          if cfg then cfg.display.textColorThresholdBaseColor = {r=r,g=g,b=b,a=1}; RefreshBar() end
+        end,
+        order = 72.53,
+        width = 0.55,
+        hidden = function()
+          if IsIconMode() or collapsedSections.stackText then return true end
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold2Spacer = {
+        type = "description", name = "", order = 72.54, width = "full",
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold2Enabled = {
+        type = "toggle", name = "Threshold 1",
+        desc = "Enable the first text color threshold.",
+        get = function() local cfg = GetSelectedConfig(); return cfg and cfg.display.textColorThreshold2Enabled end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold2Enabled = v; RefreshBar() end end,
+        order = 72.6, width = 0.8,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold2Value = {
+        type = "input", name = "Value",
+        desc = "Resource value (percent or absolute) at which this color activates.",
+        get = function() local cfg = GetSelectedConfig(); return tostring(cfg and cfg.display.textColorThreshold2Value or 15) end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold2Value = tonumber(v) or 15; RefreshBar() end end,
+        order = 72.61, width = 0.5,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold2Color = {
+        type = "color", name = "Color", hasAlpha = false,
+        get = function()
+          local cfg = GetSelectedConfig()
+          local c = cfg and cfg.display.textColorThreshold2Color or {r=1,g=0.6,b=0.8}
+          return c.r or 1, c.g or 0.6, c.b or 0.8
+        end,
+        set = function(_, r, g, b) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold2Color = {r=r,g=g,b=b,a=1}; RefreshBar() end end,
+        order = 72.62, width = 0.55,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled and cfg.display.textColorThreshold2Enabled)
+        end,
+      },
+      textColorThreshold3Enabled = {
+        type = "toggle", name = "Threshold 2",
+        desc = "Enable the second text color threshold.",
+        get = function() local cfg = GetSelectedConfig(); return cfg and cfg.display.textColorThreshold3Enabled end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold3Enabled = v; RefreshBar() end end,
+        order = 72.7, width = 0.8,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold3Value = {
+        type = "input", name = "Value",
+        get = function() local cfg = GetSelectedConfig(); return tostring(cfg and cfg.display.textColorThreshold3Value or 30) end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold3Value = tonumber(v) or 30; RefreshBar() end end,
+        order = 72.71, width = 0.5,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold3Color = {
+        type = "color", name = "Color", hasAlpha = false,
+        get = function()
+          local cfg = GetSelectedConfig()
+          local c = cfg and cfg.display.textColorThreshold3Color or {r=0.3,g=1,b=0.3}
+          return c.r or 0.3, c.g or 1, c.b or 0.3
+        end,
+        set = function(_, r, g, b) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold3Color = {r=r,g=g,b=b,a=1}; RefreshBar() end end,
+        order = 72.72, width = 0.55,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled and cfg.display.textColorThreshold3Enabled)
+        end,
+      },
+      textColorThreshold4Enabled = {
+        type = "toggle", name = "Threshold 3",
+        desc = "Enable the third text color threshold.",
+        get = function() local cfg = GetSelectedConfig(); return cfg and cfg.display.textColorThreshold4Enabled end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold4Enabled = v; RefreshBar() end end,
+        order = 72.8, width = 0.8,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold4Value = {
+        type = "input", name = "Value",
+        get = function() local cfg = GetSelectedConfig(); return tostring(cfg and cfg.display.textColorThreshold4Value or 90) end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold4Value = tonumber(v) or 90; RefreshBar() end end,
+        order = 72.81, width = 0.5,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold4Color = {
+        type = "color", name = "Color", hasAlpha = false,
+        get = function()
+          local cfg = GetSelectedConfig()
+          local c = cfg and cfg.display.textColorThreshold4Color or {r=1,g=0.2,b=0.2}
+          return c.r or 1, c.g or 0.2, c.b or 0.2
+        end,
+        set = function(_, r, g, b) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold4Color = {r=r,g=g,b=b,a=1}; RefreshBar() end end,
+        order = 72.82, width = 0.55,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled and cfg.display.textColorThreshold4Enabled)
+        end,
+      },
+      textColorThreshold5Enabled = {
+        type = "toggle", name = "Threshold 4",
+        desc = "Enable the fourth text color threshold.",
+        get = function() local cfg = GetSelectedConfig(); return cfg and cfg.display.textColorThreshold5Enabled end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold5Enabled = v; RefreshBar() end end,
+        order = 72.9, width = 0.8,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold5Value = {
+        type = "input", name = "Value",
+        get = function() local cfg = GetSelectedConfig(); return tostring(cfg and cfg.display.textColorThreshold5Value or 95) end,
+        set = function(_, v) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold5Value = tonumber(v) or 95; RefreshBar() end end,
+        order = 72.91, width = 0.5,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled)
+        end,
+      },
+      textColorThreshold5Color = {
+        type = "color", name = "Color", hasAlpha = false,
+        get = function()
+          local cfg = GetSelectedConfig()
+          local c = cfg and cfg.display.textColorThreshold5Color or {r=0.7,g=0,b=1}
+          return c.r or 0.7, c.g or 0, c.b or 1
+        end,
+        set = function(_, r, g, b) local cfg = GetSelectedConfig(); if cfg then cfg.display.textColorThreshold5Color = {r=r,g=g,b=b,a=1}; RefreshBar() end end,
+        order = 72.92, width = 0.55,
+        hidden = function()
+          if not IsResourceBar() then return true end
+          local cfg = GetSelectedConfig()
+          return not (cfg and cfg.display.showText and cfg.display.textColorThresholdEnabled and cfg.display.textColorThreshold5Enabled)
+        end,
+      },
       font = {
         type = "select",
         dialogControl = "LSM30_Font",

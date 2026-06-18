@@ -1005,6 +1005,7 @@ local cachedMaxPower = {}  -- [powerType] = maxValue
 -- Cache for ColorCurves
 local resourceColorCurves = {}  -- [barNumber] = { curve, settingsHash }
 local resourceMaxColorCurves = {}  -- [barNumber] = { curve, hash }
+local textColorCurves = {}         -- [barNumber] = { curve, hash } (text color threshold curves)
 
 -- Default threshold colors
 local RESOURCE_THRESHOLD_DEFAULT_COLORS = {
@@ -1287,11 +1288,13 @@ end
 function ns.Resources.ClearResourceColorCurve(barNumber)
   resourceColorCurves[barNumber] = nil
   resourceMaxColorCurves[barNumber] = nil
+  textColorCurves[barNumber] = nil
 end
 
 function ns.Resources.ClearAllResourceColorCurves()
   wipe(resourceColorCurves)
   wipe(resourceMaxColorCurves)
+  wipe(textColorCurves)
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -1428,6 +1431,181 @@ local function GetMaxColorOnlyCurve(barNumber, barConfig, topColor, powerType)
 
   resourceMaxColorCurves[barNumber] = { curve = curve, hash = hash }
   return curve
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- TEXT COLOR THRESHOLD SYSTEM
+-- Colors the resource text based on the current value.
+-- Primary resources: UnitPowerPercent + ColorCurve (secret-safe).
+-- Secondary resources: direct comparison with non-secret displayValue.
+-- Mirrors bar color threshold structure but targets text vertex color.
+-- ═══════════════════════════════════════════════════════════════
+
+local TEXT_THRESHOLD_DEFAULT_VALUES = {
+  [2] = 15, [3] = 30, [4] = 90, [5] = 95,
+}
+local TEXT_THRESHOLD_DEFAULT_COLORS = {
+  [2] = {r=1, g=0.6, b=0.8, a=1},
+  [3] = {r=0.3, g=1, b=0.3, a=1},
+  [4] = {r=1, g=0.2, b=0.2, a=1},
+  [5] = {r=0.7, g=0, b=1, a=1},
+}
+
+local function GetTextColorCurveHash(cfg)
+  local parts = {}
+  local bc = cfg.textColorThresholdBaseColor or {r=1,g=1,b=1}
+  table.insert(parts, string.format("bc:%.2f,%.2f,%.2f", bc.r or 1, bc.g or 1, bc.b or 1))
+  for i = 2, 5 do
+    if cfg["textColorThreshold" .. i .. "Enabled"] then
+      local v = cfg["textColorThreshold" .. i .. "Value"] or TEXT_THRESHOLD_DEFAULT_VALUES[i]
+      local c = cfg["textColorThreshold" .. i .. "Color"] or TEXT_THRESHOLD_DEFAULT_COLORS[i]
+      table.insert(parts, string.format("t%d:%d,%.2f,%.2f,%.2f", i, v, c.r or 1, c.g or 1, c.b or 1))
+    end
+  end
+  table.insert(parts, cfg.textColorThresholdAsPercent ~= false and "pct" or "num")
+  table.insert(parts, cfg.textColorThresholdFill and "fill" or "drain")
+  return table.concat(parts, "|")
+end
+
+local function GetTextColorCurve(barNumber, cfg, powerType)
+  if not cfg.textColorThresholdEnabled then return nil end
+  if not C_CurveUtil or not C_CurveUtil.CreateColorCurve then return nil end
+
+  local currentHash = GetTextColorCurveHash(cfg)
+  local cached = textColorCurves[barNumber]
+  if cached and cached.hash == currentHash then return cached.curve end
+
+  local thresholds = {}
+  for i = 2, 5 do
+    if cfg["textColorThreshold" .. i .. "Enabled"] then
+      local value = cfg["textColorThreshold" .. i .. "Value"] or TEXT_THRESHOLD_DEFAULT_VALUES[i]
+      local color = cfg["textColorThreshold" .. i .. "Color"] or TEXT_THRESHOLD_DEFAULT_COLORS[i]
+      table.insert(thresholds, {value=value, color=color})
+    end
+  end
+
+  if #thresholds == 0 then
+    textColorCurves[barNumber] = nil
+    return nil
+  end
+
+  table.sort(thresholds, function(a,b) return a.value < b.value end)
+
+  local asPercent = cfg.textColorThresholdAsPercent ~= false
+  local isFilling = cfg.textColorThresholdFill == true
+  local maxValue = 100
+  if not asPercent and powerType then
+    local cachedMax = GetCachedMaxPower(powerType)
+    if cachedMax and cachedMax > 0 then maxValue = cachedMax end
+  end
+
+  local baseColor = cfg.textColorThresholdBaseColor or {r=1,g=1,b=1,a=1}
+  local EPSILON = 0.0001
+  local curve = C_CurveUtil.CreateColorCurve()
+
+  if isFilling then
+    local bR, bG, bB, bA = SafeColorRGBA(baseColor)
+    curve:AddPoint(0.0, CreateColor(bR, bG, bB, bA))
+    for i = 1, #thresholds do
+      local t = thresholds[i]
+      local pct = asPercent and (t.value / 100) or (t.value / maxValue)
+      pct = math.max(0, math.min(1, pct))
+      local prevColor = (i == 1) and baseColor or thresholds[i-1].color
+      local pR, pG, pB, pA = SafeColorRGBA(prevColor)
+      if pct > EPSILON then curve:AddPoint(pct - EPSILON, CreateColor(pR, pG, pB, pA)) end
+      local tR, tG, tB, tA = SafeColorRGBA(t.color)
+      curve:AddPoint(pct, CreateColor(tR, tG, tB, tA))
+    end
+    local hR, hG, hB, hA = SafeColorRGBA(thresholds[#thresholds].color)
+    curve:AddPoint(1.0, CreateColor(hR, hG, hB, hA))
+  else
+    local lR, lG, lB, lA = SafeColorRGBA(thresholds[1].color)
+    curve:AddPoint(0.0, CreateColor(lR, lG, lB, lA))
+    for i = 1, #thresholds do
+      local t = thresholds[i]
+      local pct = asPercent and (t.value / 100) or (t.value / maxValue)
+      pct = math.max(0, math.min(1, pct))
+      local cR, cG, cB, cA = SafeColorRGBA(t.color)
+      if pct > EPSILON then curve:AddPoint(pct - EPSILON, CreateColor(cR, cG, cB, cA)) end
+      local nextColor = (i == #thresholds) and baseColor or thresholds[i+1].color
+      local nR, nG, nB, nA = SafeColorRGBA(nextColor)
+      curve:AddPoint(pct, CreateColor(nR, nG, nB, nA))
+    end
+    local bR, bG, bB, bA = SafeColorRGBA(baseColor)
+    curve:AddPoint(1.0, CreateColor(bR, bG, bB, bA))
+  end
+
+  textColorCurves[barNumber] = {curve=curve, hash=currentHash}
+  return curve
+end
+
+-- For secondary resources where displayValue is non-secret (Runes, aura-counted resources, etc.)
+local function EvaluateTextThresholdDirectly(cfg, displayValue, maxValue)
+  if not cfg.textColorThresholdEnabled then return nil end
+
+  local thresholds = {}
+  local asPercent = cfg.textColorThresholdAsPercent ~= false
+  local isFilling = cfg.textColorThresholdFill == true
+
+  for i = 2, 5 do
+    if cfg["textColorThreshold" .. i .. "Enabled"] then
+      local value = cfg["textColorThreshold" .. i .. "Value"] or TEXT_THRESHOLD_DEFAULT_VALUES[i]
+      local color = cfg["textColorThreshold" .. i .. "Color"] or TEXT_THRESHOLD_DEFAULT_COLORS[i]
+      local absValue = asPercent and (value / 100 * (maxValue or 100)) or value
+      table.insert(thresholds, {value=absValue, color=color})
+    end
+  end
+
+  if #thresholds == 0 then return nil end
+  table.sort(thresholds, function(a,b) return a.value < b.value end)
+
+  local baseColor = cfg.textColorThresholdBaseColor or {r=1,g=1,b=1,a=1}
+
+  if isFilling then
+    for i = #thresholds, 1, -1 do
+      if displayValue >= thresholds[i].value then return thresholds[i].color end
+    end
+    return baseColor
+  else
+    for i = 1, #thresholds do
+      if displayValue < thresholds[i].value then return thresholds[i].color end
+    end
+    return baseColor
+  end
+end
+
+-- Apply text color threshold to textFrame.text. Call from both UpdateBar and UpdateBarValue.
+-- For primary resources: uses UnitPowerPercent + ColorCurve (SetVertexColor, secret-safe).
+-- For secondary with non-secret displayValue: uses direct comparison (SetTextColor).
+-- When threshold is off, applies the static textColor setting.
+local function ApplyResourceTextColor(barNumber, displayCfg, powerType, isSecondary, displayValue, maxValue, textFrame)
+  if not textFrame or not textFrame.text then return end
+
+  if displayCfg.textColorThresholdEnabled then
+    if isSecondary and type(displayValue) == "number" then
+      local color = EvaluateTextThresholdDirectly(displayCfg, displayValue, maxValue)
+      if color then
+        textFrame.text:SetTextColor(color.r or 1, color.g or 1, color.b or 1, 1)
+        textFrame.text:SetVertexColor(1, 1, 1, 1)
+        return
+      end
+    elseif powerType and powerType >= 0 then
+      local curve = GetTextColorCurve(barNumber, displayCfg, powerType)
+      if curve then
+        local colorResult = UnitPowerPercent("player", powerType, false, curve)
+        if colorResult and colorResult.GetRGBA then
+          textFrame.text:SetTextColor(1, 1, 1, 1)
+          textFrame.text:SetVertexColor(colorResult:GetRGBA())
+          return
+        end
+      end
+    end
+  end
+
+  -- Fallback: static textColor + clear any vertex tint
+  local tc = displayCfg.textColor or {r=1,g=1,b=1,a=1}
+  textFrame.text:SetTextColor(tc.r or 1, tc.g or 1, tc.b or 1, tc.a or 1)
+  textFrame.text:SetVertexColor(1, 1, 1, 1)
 end
 
 -- Cache max power for all common power types (call on PLAYER_ENTERING_WORLD, etc.)
@@ -5600,9 +5778,10 @@ function ns.Resources.UpdateBar(barNumber)
       -- Default: raw value
       textFrame.text:SetText(secretValue)
     end
-    local tc = cfg.display.textColor or {r=1, g=1, b=1, a=1}
-    textFrame.text:SetTextColor(tc.r or 1, tc.g or 1, tc.b or 1, tc.a or 1)
-    
+    -- Apply text color: threshold system takes priority over static textColor
+    local resolvedPT = (resourceCategory ~= "secondary") and ResolvePowerType(cfg) or nil
+    ApplyResourceTextColor(barNumber, cfg.display, resolvedPT, resourceCategory == "secondary", displayValue, maxValue, textFrame)
+
     -- Prediction text override (soul shards only, non-secret so we can format freely)
     local predTextFmt = cfg.display.predTextFormat or "none"
     if Prediction.active and predTextFmt ~= "none" and cfg.tracking.secondaryType == "soulShards" then
@@ -5904,6 +6083,8 @@ local function UpdateBarValue(barNumber)
     else
       textFrame.text:SetText(secretValue)
     end
+    local bvPT = (resourceCategory ~= "secondary") and ResolvePowerType(cfg) or nil
+    ApplyResourceTextColor(barNumber, cfg.display, bvPT, resourceCategory == "secondary", displayValue, maxValue, textFrame)
     textFrame:Show()
   end
 end
