@@ -915,9 +915,22 @@ local ForceHideCDMFrame
 -- ═══════════════════════════════════════════════════════════════════════════
 local cdmHideRequestsByCD = {}  -- [cooldownID] = { [barNumber] = true, ... }
 
--- Register a bar's request to hide a specific cooldownID
+-- Register a bar's request to hide a specific cooldownID.
+-- INVARIANT: a bar is registered under at most ONE cooldownID at a time. If this
+-- bar's resolved cooldownID flipped (cross-spec alternate, SelectBuff re-point),
+-- drop its prior entries first — otherwise a stale entry would keep force-hiding
+-- the OLD icon and AnyCDMHideRequestForCD would wrongly report it still wanted.
+-- (Re-showing a now-orphaned frame is handled by ReassertCDMHideRequests; keeping
+-- this single-entry invariant also keeps UnregisterCDMHideRequest's one-shot
+-- removal correct.) Removing the current iteration key during pairs() is allowed.
 local function RegisterCDMHideRequest(barNumber, cooldownID)
   if not cooldownID then return end
+  for cdID, bars in pairs(cdmHideRequestsByCD) do
+    if cdID ~= cooldownID and bars[barNumber] then
+      bars[barNumber] = nil
+      if not next(bars) then cdmHideRequestsByCD[cdID] = nil end
+    end
+  end
   if not cdmHideRequestsByCD[cooldownID] then
     cdmHideRequestsByCD[cooldownID] = {}
   end
@@ -1010,6 +1023,19 @@ local function GetOrCreateHiddenOverlay(frame)
   hiddenByBarOverlays[frame] = overlay
   return overlay
 end
+
+-- Hide (but KEEP cached) the red "Hidden" overlay on a frame CDM is reshuffling,
+-- so a stale overlay doesn't linger on an icon that no longer holds the hidden
+-- cooldownID. Does NOT drop the cached overlay (RefreshHiddenCDMFrames /
+-- CleanupFrameHidingState nils it later) so GetOrCreateHiddenOverlay can reuse it.
+-- Called (guarded) from FrameController's reshuffle hooks. Safe sink (Hide on an
+-- ArcUI-created child frame); no Blizzard-frame writes.
+local function HideOverlayOnFrame(frame)
+  if frame and hiddenByBarOverlays[frame] then
+    hiddenByBarOverlays[frame]:Hide()
+  end
+end
+ns.API.HideOverlayOnFrame = HideOverlayOnFrame
 
 -- Helper to find a CDM frame by cooldownID across all viewers,
 -- CDMGroups containers (reparented frames), and free icons.
@@ -1251,6 +1277,134 @@ ns.API = ns.API or {}
 ns.API.ShowHiddenByBarOverlays = ShowAllHiddenByBarOverlays
 ns.API.HideHiddenByBarOverlays = HideAllHiddenByBarOverlays
 ns.API.RefreshHiddenCDMFrames = RefreshHiddenCDMFrames
+
+-- The cooldownID a bar is currently hiding on this frame (nil if none). Lets
+-- FrameController distinguish a same-id refresh (re-assert) from a real
+-- reassignment (release) in BOTH options-open and options-closed modes:
+-- hiddenCDMFrames is the mode-independent source of truth (the per-frame
+-- _arcHiddenByBar flag is nil while the options panel is showing overlays).
+local function GetCDMHiddenCooldownID(frame)
+  if not frame then return nil end
+  return hiddenCDMFrames[frame]
+end
+ns.API.GetCDMHiddenCooldownID = GetCDMHiddenCooldownID
+
+-- Re-assert the correct hidden state for a single CDM frame that CDM just
+-- (re)assigned to a cooldownID a bar is hiding. FrameController calls this from
+-- its SetCooldownID hook on a same-id/no-op refresh — CDM's RefreshData re-sets
+-- each frame's CURRENT cooldownID every cycle and hooksecurefunc fires even
+-- though SetCooldownID's body no-ops, so without re-asserting, the frame
+-- force-shows (options closed) or loses its overlay (options open) between bar
+-- updates. Routes through ForceHideCDMFrame, which re-applies the right state
+-- (hide vs show+overlay) and re-installs the protection hooks. Only acts on
+-- frames this addon is actually hiding (guards against hiding arbitrary frames).
+local function ReassertCDMHideForFrame(frame, cooldownID)
+  if not frame or not cooldownID then return end
+  if hiddenCDMFrames[frame] ~= cooldownID then return end
+  ForceHideCDMFrame(frame, cooldownID)
+end
+ns.API.ReassertCDMHideForFrame = ReassertCDMHideForFrame
+
+-- Hide a frame CDM just assigned a cooldownID that a bar has requested hidden,
+-- even if we've never hidden THIS frame before. FrameController calls this from
+-- its SetCooldownID hook for fresh/untracked frames, so a buff icon CDM creates
+-- at login/reload (or a buff reappearing on a new pool frame) is hidden in the
+-- same tick CDM binds it — instead of staying visible until the next bar update
+-- (which only runs on combat/target/etc., the "hidden only after I right-clicked
+-- a mob" symptom). O(1) registry lookup; no-op unless a bar wants this cooldownID.
+local function HideCDMFrameIfRequested(frame, cooldownID)
+  if not frame or not cooldownID then return end
+  if not cdmHideRequestsByCD[cooldownID] then return end
+  ForceHideCDMFrame(frame, cooldownID)
+end
+ns.API.HideCDMFrameIfRequested = HideCDMFrameIfRequested
+
+-- Is this bar shown in the current spec? Mirrors UpdateBarBuffInfo's spec gate so
+-- a wrong-spec bar never hides (or keeps hidden) the Blizzard frame.
+local function BarShownInCurrentSpec(barConfig)
+  local b = barConfig.behavior
+  if not b then return true end
+  local cur = (ns.Display and ns.Display.GetCachedSpec and ns.Display.GetCachedSpec()) or GetSpecialization() or 0
+  if b.showOnSpecs and #b.showOnSpecs > 0 then
+    for _, s in ipairs(b.showOnSpecs) do
+      if s == cur then return true end
+    end
+    return false
+  elseif b.showOnSpec and b.showOnSpec > 0 then
+    return cur == b.showOnSpec
+  end
+  return true
+end
+
+-- Authoritatively reconcile the persistent CDM hide-request registry against
+-- current bar config, then hide any buff-viewer frame already showing a requested
+-- cooldownID. Runs from ValidateAllBarTracking (login/reload/spec/data-loaded/
+-- config change) so the registry is populated the moment we know what to hide —
+-- BEFORE any bar update or combat — which (together with FrameController's
+-- HideCDMFrameIfRequested on later assignments) makes the icon hidden on load.
+-- Independent of whether the tracked aura is currently active.
+local function ReassertCDMHideRequests()
+  local db = ns.API.GetDB and ns.API.GetDB()
+  if not db or not db.bars then return end
+
+  for barNum = 1, 30 do
+    local bc = db.bars[barNum]
+    local wants = bc and bc.tracking and bc.tracking.enabled
+                  and bc.behavior and bc.behavior.hideBuffIcon
+                  and BarShownInCurrentSpec(bc)
+    if wants then
+      -- Prefer the resolved cooldownID (cross-spec alternates), else the configured
+      -- primary — exactly what the hide block registers.
+      local st = ns.API.GetBarState and ns.API.GetBarState(barNum)
+      local cdID = (st and st.cooldownID) or bc.tracking.cooldownID
+      if cdID and type(cdID) == "number" and cdID > 0 then
+        RegisterCDMHideRequest(barNum, cdID)
+      end
+    else
+      -- Bar no longer wants to hide (disabled / toggled off / wrong spec): drop its
+      -- request and re-show the freed frame if nothing else still hides it.
+      local freed = UnregisterCDMHideRequest(barNum)
+      if freed and not AnyCDMHideRequestForCD(freed, barNum) then
+        local f = FindCDMFrameForCooldownID(freed)
+        if f then AllowCDMFrameVisible(f) end
+      end
+    end
+  end
+
+  -- Re-show any frame we still have hidden whose cooldownID NO bar requests anymore
+  -- (a bar's resolved cooldownID flipped and orphaned the old icon). Without this
+  -- the old Blizzard icon would stay stuck hidden until reload/spec change. Snapshot
+  -- first — AllowCDMFrameVisible mutates hiddenCDMFrames via CleanupFrameHidingState.
+  local orphans
+  for frame, cdID in pairs(hiddenCDMFrames) do
+    if not (cdID and cdmHideRequestsByCD[cdID]) then
+      orphans = orphans or {}
+      orphans[#orphans + 1] = frame
+    end
+  end
+  if orphans then
+    for _, frame in ipairs(orphans) do
+      AllowCDMFrameVisible(frame)
+    end
+  end
+
+  -- Hide the frame currently bound to each requested cooldownID, wherever it lives:
+  -- a standard CDM viewer, a CDMGroups container, OR a reparented FREE ICON.
+  -- CRITICAL: use FindCDMFrameForCooldownID (which checks group members + free
+  -- icons + viewers), NOT a BuffBar/BuffIconCooldownViewer children scan. Free and
+  -- grouped icons are reparented OUT of those viewers, so a children scan misses
+  -- them — which is exactly why a free-icon buff stayed visible on reload until
+  -- combat re-bound it (RefreshData -> SetCooldownID -> HideCDMFrameIfRequested).
+  -- Once ForceHideCDMFrame runs, its Show/SetShown hooks keep it hidden against
+  -- any later show (including Core's own restore step and CDM refreshes).
+  for cdID in pairs(cdmHideRequestsByCD) do
+    local f = FindCDMFrameForCooldownID(cdID)
+    if f and not hiddenCDMFrames[f] then
+      ForceHideCDMFrame(f, cdID)
+    end
+  end
+end
+ns.API.ReassertCDMHideRequests = ReassertCDMHideRequests
 
 -- Release all hidden CDM frame tracking for spec change.
 -- CDM will manage its own frame visibility during the transition;
@@ -2022,6 +2176,10 @@ function ns.API.ValidateAllBarTracking(validCooldownIDs, debugMode)
     end
   end
   
+  -- Populate the persistent hide registry + hide already-shown frames now, so the
+  -- icon is hidden on load/spec change without waiting for a bar update (combat/
+  -- target). FrameController hides any later assignment via HideCDMFrameIfRequested.
+  ReassertCDMHideRequests()
   UpdateAllBars()
 end
 

@@ -3223,8 +3223,14 @@ ApplyIconStyle = function(frame, cdID)
       -- ArcUI controls: Apply all user settings
       frame.Cooldown:SetDrawSwipe(swipeCfg.showSwipe ~= false)
       frame.Cooldown:SetDrawEdge(swipeCfg.showEdge ~= false)
-      frame.Cooldown:SetReverse(swipeCfg.reverse == true)
-      
+      -- Aura-aware reverse: honor "Reverse While Aura Active" right here in the
+      -- style-apply path. This path re-runs on CDM's post-combat refresh; if it
+      -- only set the base reverse it would stomp the reversed direction back to
+      -- normal while the aura is still up (the out-of-combat revert bug). Mirrors
+      -- the Masque SetCooldown hook above, the aura-transition handlers, and CooldownState.
+      local auraActive = (frame._arcAuraActive == true) or (frame.totemData ~= nil)
+      frame.Cooldown:SetReverse((swipeCfg.reverse == true) or (auraActive and swipeCfg.reverseWhileAura == true))
+
       -- Apply edge scale (size of spinning edge line)
       if swipeCfg.edgeScale and frame.Cooldown.SetEdgeScale then
         frame.Cooldown:SetEdgeScale(swipeCfg.edgeScale)
@@ -10098,17 +10104,6 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
               data.frame._arcEnforceReadyAlpha = nil
               ApplyCooldownStateVisuals(data.frame, cfg, cfg.alpha or 1.0)
             end
-            -- Re-assert reverse-swipe-while-aura. CDM resets the swipe direction on
-            -- its post-combat refresh, and the aura-transition hook only fires on a
-            -- transition — so an aura already active before combat ended never gets
-            -- re-reversed. Re-derive from the LIVE aura state (covers reverseWhileAura
-            -- frames even when they have no state visuals, so it's outside the gate).
-            local swipe = cfg.cooldownSwipe
-            if swipe and swipe.reverseWhileAura and data.frame.Cooldown then
-              local auraActive = (data.frame._arcAuraActive == true)
-                or HasAuraInstanceID(data.frame.auraInstanceID) or (data.frame.totemData ~= nil)
-              data.frame.Cooldown:SetReverse((swipe.reverse == true) or auraActive)
-            end
           end
         end
       end
@@ -10127,14 +10122,6 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
               data.frame._arcTargetAlpha = nil
               data.frame._arcEnforceReadyAlpha = nil
               ApplyCooldownStateVisuals(data.frame, cfg, cfg.alpha or 1.0)
-            end
-            -- Re-assert reverse-swipe-while-aura (see the +0.1s pass) on the later
-            -- straggler wave too, in case CDM's reset lands after the first pass.
-            local swipe = cfg.cooldownSwipe
-            if swipe and swipe.reverseWhileAura and data.frame.Cooldown then
-              local auraActive = (data.frame._arcAuraActive == true)
-                or HasAuraInstanceID(data.frame.auraInstanceID) or (data.frame.totemData ~= nil)
-              data.frame.Cooldown:SetReverse((swipe.reverse == true) or auraActive)
             end
           end
         end

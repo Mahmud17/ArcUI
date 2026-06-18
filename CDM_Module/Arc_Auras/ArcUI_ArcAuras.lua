@@ -5269,6 +5269,41 @@ end
 eventFrame:SetScript("OnEvent", Track and Track("ArcAuras.OnEvent", _arcAurasOnEvent) or _arcAurasOnEvent)
 
 -- ═══════════════════════════════════════════════════════════════════════════
+-- READY GLOW RE-EVAL ON GROUP SHOW
+--
+-- "Show only in combat" groups hide via container ALPHA (SafeShowContainer), not
+-- :Hide() — so child item/trinket frames keep IsShown()==true the whole time; only
+-- the container alpha and the _arcGroupHidden flag change. The item ready-glow check
+-- only (re)starts a glow on a ready/cooldown STATE change, so a trinket that was
+-- already off cooldown while its group was faded out never starts its "glow when
+-- ready" when the group fades back in on combat entry — it just sat dark until some
+-- unrelated cooldown event happened to re-evaluate it (the reported "trinket glow
+-- doesn't appear until ~20s into combat" bug).
+--
+-- UpdateGroupVisibility is the authoritative group shown/hidden signal. This
+-- post-hook runs AFTER SafeShowContainer has set the final container alpha and
+-- cleared _arcGroupHidden, so the frame is genuinely visible now — re-run the normal
+-- visual pass on each now-visible item frame. UpdateArcItemFrame starts the ready
+-- glow when it should show and isn't already showing (idempotent: glow start is
+-- gated on "not currently showing", so no churn if it's already up; group-hidden
+-- frames are skipped so we never start a glow behind a faded-out container).
+-- Spell frames are handled by ArcAurasCooldown's own combat handler.
+-- ═══════════════════════════════════════════════════════════════════════════
+if ns.CDMGroups and ns.CDMGroups.UpdateGroupVisibility then
+    hooksecurefunc(ns.CDMGroups, "UpdateGroupVisibility", function()
+        if not ArcAuras.isEnabled then return end
+        for arcID, frame in pairs(ArcAuras.frames) do
+            if frame and not frame._arcIsSpellCooldown and frame:IsShown() then
+                local parent = frame:GetParent()
+                if not (frame._arcGroupHidden or (parent and parent._arcGroupHidden)) then
+                    UpdateArcItemFrame(frame, arcID)
+                end
+            end
+        end
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
 -- SLASH COMMANDS
 -- ═══════════════════════════════════════════════════════════════════════════
 

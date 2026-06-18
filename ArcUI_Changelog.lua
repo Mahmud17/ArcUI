@@ -36,8 +36,8 @@ CL.versions = {
           { title = "Castbar", desc = "A brand-new player cast bar, with per-cast-type profiles, an optional Auto Share toggle so one cast type's look carries across the others, full support for empowered spells (proper stage segments and timing), and threshold-based color changes. Big thanks to Sadraii, who created the original cast bar module this was expanded from." },
           { title = "Dynamic Cooldowns", desc = "A new per-group option that compacts your cooldown icons the same way Dynamic Auras does: icons drop out and the rest slide together based on whether they're ready or on cooldown. Works hand-in-hand with Dynamic Auras." },
           { title = "Smooth Movement", desc = "When a dynamic group rearranges, icons now glide smoothly into their new spot instead of snapping, with an adjustable speed. Opt-in per group." },
-          { title = "Icon Order — First Come, First Served", desc = "Choose how a dynamic group orders its icons: classic Priority order, or First Come First Served, where the icon that became active first keeps its spot and new ones line up after it instead of everything reshuffling." },
-          { title = "Custom Icon Stacks — Start Full & Recharge", desc = "Custom timer icons can now show full stacks from the start before the first cast, plus a new \"Timer Complete\" generator with \"Recharge until full\" to build charge-style stack behavior." },
+          { title = "Icon Order: First Come, First Served", desc = "Choose how a dynamic group orders its icons: classic Priority order, or First Come First Served, where the icon that became active first keeps its spot and new ones line up after it instead of everything reshuffling." },
+          { title = "Custom Icon Stacks: Start Full & Recharge", desc = "Custom timer icons can now show full stacks from the start before the first cast, plus a new \"Timer Complete\" generator with \"Recharge until full\" to build charge-style stack behavior." },
           { title = "What's New Window", desc = "ArcUI now shows a changelog after each update so you always know what changed. Toggle it off in Settings." },
         },
       },
@@ -53,6 +53,7 @@ CL.versions = {
         header = "Bug Fixes", color = C_FIX, items = {
           { title = "Reverse Swipe While Aura Active", desc = "Fixed the swipe reverting to its normal direction when you left combat while the aura was still active; it now stays reversed for the full duration." },
           { title = "Charge Spell Placement", desc = "Fixed dynamic placement sometimes failing on charge spells, where an icon wouldn't collapse or return as a charge was spent or came back." },
+          { title = "Hide CDM Icon Staying Hidden", desc = "Fixed the Blizzard cooldown frame reappearing when a bar had \"Hide CDM Icon\" turned on: after logging in or reloading, on entering or leaving combat, and when opening the options panel. It now stays hidden at all times, including free-floating icons." },
         },
       },
     },
@@ -69,6 +70,15 @@ local function GetCurrentVersion()
     return GetAddOnMetadata(ADDON, "Version") or "?"
   end
   return "?"
+end
+
+-- Base version with any minor hotfix suffix stripped: "3.7.2.a" -> "3.7.2".
+-- The auto-show tracks the BASE version so a minor hotfix (.a/.b) does NOT re-pop
+-- the What's New window for players who already saw the base release. Players who
+-- never saw the base release still get it (their lastSeen won't match the base),
+-- and a hotfix's notes are merged into the base entry so they see those too.
+local function GetBaseVersion()
+  return (GetCurrentVersion():gsub("%.%a+$", ""))
 end
 
 -- Build the full coloured, scrollable text body from the versions table.
@@ -247,9 +257,9 @@ local function CheckOnLogin()
   g.changelog = g.changelog or {}
   if g.changelog.disabled then return end
 
-  local cur = GetCurrentVersion()
+  local cur = GetBaseVersion()   -- base version: minor hotfixes (.a/.b) don't re-pop
   if g.changelog.lastSeen ~= cur then
-    g.changelog.lastSeen = cur   -- mark seen so it only pops once per version
+    g.changelog.lastSeen = cur   -- mark seen so it only pops once per base version
     CL.Show()
   end
 end
