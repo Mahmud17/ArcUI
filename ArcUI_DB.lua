@@ -638,6 +638,12 @@ ns.DB_DEFAULTS = {
       tickMarksDefaultCount = 0,
       -- Reverse fill direction: channels fill instead of drain; casts drain instead of fill
       reverseFill = false,
+      -- Spell name shortening
+      spellShortenEnabled = false,
+      spellShortenLength  = 20,
+      -- Icon independent positioning
+      iconMovable  = false,
+      iconPosition = nil,  -- {point, relPoint, x, y} relative to bar frame; nil = default left of bar
       presets = {},
     },
 

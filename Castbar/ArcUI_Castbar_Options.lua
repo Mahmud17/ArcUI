@@ -545,6 +545,36 @@ function ns.CastbarOptions.GetOptionsTable()
         set    = function(_, v) local c = GetCastbarDB(); if c then c.iconSize = v; Refresh() end end,
       },
 
+      iconMovable = {
+        type  = "toggle",
+        name  = "Movable Icon",
+        desc  = "Allow the spell icon to be dragged independently of the castbar. A grip handle appears on the icon while this panel is open.",
+        order = 53,
+        hidden = function() local c = GetCastbarDB(); return not (c and c.showIcon) end,
+        get   = function() local c = GetCastbarDB(); return c and c.iconMovable end,
+        set   = function(_, v) local c = GetCastbarDB(); if c then c.iconMovable = v; Refresh() end end,
+      },
+
+      iconMovableDesc = {
+        type     = "description",
+        name     = "|cffaaaaaaDrag the blue grip on the icon corner while this panel is open to reposition it. Position is saved relative to the castbar and moves with it.|r",
+        order    = 53.1,
+        fontSize = "small",
+        hidden   = function() local c = GetCastbarDB(); return not (c and c.showIcon and c.iconMovable) end,
+      },
+
+      iconResetPos = {
+        type   = "execute",
+        name   = "Reset Icon Position",
+        desc   = "Return the icon to its default position (left of the castbar).",
+        order  = 53.2,
+        hidden = function() local c = GetCastbarDB(); return not (c and c.showIcon and c.iconMovable) end,
+        func   = function()
+          local c = GetCastbarDB()
+          if c then c.iconPosition = nil; Refresh() end
+        end,
+      },
+
       -- ── Text ───────────────────────────────────────────────────────
       textHeader = { type = "header", name = "Text", order = 60 },
 
@@ -554,6 +584,30 @@ function ns.CastbarOptions.GetOptionsTable()
         order = 61,
         get   = function() local c = GetCastbarDB(); return c and c.showText end,
         set   = function(_, v) local c = GetCastbarDB(); if c then c.showText = v; Refresh() end end,
+      },
+
+      spellShortenEnabled = {
+        type   = "toggle",
+        name   = "Shorten Spell Name",
+        desc   = "Truncate long spell names to the configured length.",
+        order  = 61.1,
+        hidden = function() local c = GetCastbarDB(); return not (c and c.showText) end,
+        get    = function() local c = GetCastbarDB(); return c and c.spellShortenEnabled end,
+        set    = function(_, v) local c = GetCastbarDB(); if c then c.spellShortenEnabled = v; Refresh() end end,
+      },
+
+      spellShortenLength = {
+        type   = "range",
+        name   = "Max Characters",
+        desc   = "Spell names longer than this are truncated with '...'",
+        order  = 61.2,
+        min    = 4, max = 60, step = 1,
+        hidden = function()
+          local c = GetCastbarDB()
+          return not (c and c.showText and c.spellShortenEnabled)
+        end,
+        get = function() local c = GetCastbarDB(); return c and c.spellShortenLength or 20 end,
+        set = function(_, v) local c = GetCastbarDB(); if c then c.spellShortenLength = v; Refresh() end end,
       },
 
       showTimer = {

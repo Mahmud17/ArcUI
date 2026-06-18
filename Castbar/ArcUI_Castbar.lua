@@ -40,6 +40,8 @@ local activeTicks = 0              -- number of tick dividers currently shown (0
 local castCurrentGUID  = nil   -- GUID from the CHANNEL/EMPOWER_START that opened the current bar
 local castChannelEnded = false -- true between CHANNEL_STOP and the next CHANNEL_START (hold window)
 local channelStopTime  = 0     -- GetTime() when CHANNEL_STOP fired
+local castCachedCfg    = nil   -- cfg pointer cached at ShowCast, cleared at StopCast (avoids per-frame DB lookup)
+local timerLastBucket  = -1    -- throttle: only rebuild timer string when the 0.1s bucket changes
 -- ===================================================================
 -- DEBUG
 -- Toggle with /arccastdebug
@@ -90,14 +92,57 @@ local function CreateCastbarFrames()
   frame.borderOverlay.left:SetSnapToPixelGrid(false);   frame.borderOverlay.left:SetTexelSnappingBias(0)
   frame.borderOverlay.right:SetSnapToPixelGrid(false);  frame.borderOverlay.right:SetTexelSnappingBias(0)
 
-  -- Icon frame (to the left of the bar)
+  -- Icon frame (default: left of the bar; independently movable when iconMovable = true)
   frame.iconFrame = CreateFrame("Frame", nil, frame)
   frame.iconFrame:SetSize(20, 20)
   frame.iconFrame:SetPoint("RIGHT", frame, "LEFT", -2, 0)
   frame.iconFrame:SetFrameLevel(frame:GetFrameLevel() + 5)
+  frame.iconFrame:SetMovable(true)
+  frame.iconFrame:SetClampedToScreen(true)
   frame.iconTex = frame.iconFrame:CreateTexture(nil, "ARTWORK")
   frame.iconTex:SetAllPoints()
   frame.iconTex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+  -- Saves iconFrame position (relative to bar frame) into cfg.iconPosition
+  local function SaveIconPosition()
+    local cfg = GetCastbarDB()
+    if not (cfg and cfg.iconMovable) then return end
+    local point, _, relPoint, x, y = frame.iconFrame:GetPoint()
+    if point then
+      cfg.iconPosition = { point = point, relPoint = relPoint,
+        x = math.floor(x + 0.5), y = math.floor(y + 0.5) }
+    end
+  end
+
+  -- Small drag handle that appears on the icon when options are open + iconMovable is true
+  local iconDragBtn = CreateFrame("Button", nil, frame.iconFrame, "BackdropTemplate")
+  iconDragBtn:SetSize(14, 14)
+  iconDragBtn:SetFrameStrata("HIGH")
+  iconDragBtn:SetFrameLevel(300)
+  iconDragBtn:SetPoint("TOPLEFT", frame.iconFrame, "TOPLEFT", 0, 0)
+  iconDragBtn:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8x8",
+    edgeFile = "Interface\\Buttons\\WHITE8x8", edgeSize = 1 })
+  iconDragBtn:SetBackdropColor(0.15, 0.4, 0.7, 0.85)
+  iconDragBtn:SetBackdropBorderColor(0.3, 0.7, 1.0, 1)
+  local iconMoveIcon = iconDragBtn:CreateTexture(nil, "OVERLAY")
+  iconMoveIcon:SetSize(10, 10)
+  iconMoveIcon:SetPoint("CENTER")
+  iconMoveIcon:SetTexture("Interface\\CURSOR\\UI-Cursor-Move")
+  iconMoveIcon:SetVertexColor(1, 1, 1, 1)
+  iconDragBtn:RegisterForDrag("LeftButton")
+  iconDragBtn:EnableMouse(true)
+  iconDragBtn:Hide()
+  iconDragBtn:SetScript("OnDragStart", function() frame.iconFrame:StartMoving() end)
+  iconDragBtn:SetScript("OnDragStop", function()
+    frame.iconFrame:StopMovingOrSizing(); SaveIconPosition()
+  end)
+  iconDragBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Drag to reposition spell icon\nPosition saved relative to castbar", 1, 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  iconDragBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  frame.iconFrame.iconDragBtn = iconDragBtn
 
   -- Segment bars for empowered casts — one StatusBar per stage, fills with its own color
   -- Pool of 8 supports up to empowerMaxStages = 8; unused bars stay hidden.
@@ -296,6 +341,12 @@ local function GetSpellOverride(spellID, cfg)
     if ov.spellID == spellID then return ov end
   end
   return nil
+end
+
+-- Truncates a spell name to maxLen characters, appending "..." if truncated.
+local function ShortenSpellName(name, maxLen)
+  if not name or #name <= maxLen then return name end
+  return name:sub(1, maxLen) .. "..."
 end
 
 -- Returns: fillColor {r,g,b,a}, overrideTexPath (or nil), borderColorOverride (or nil)
@@ -528,13 +579,25 @@ function ns.Castbar.ApplyAppearance()
     if activeTicks > 0 then PlaceTickMarks(activeTicks) end
   end
 
-  -- Icon
+  -- Icon size and position
   local iconSize = PixelSize(cfg.iconSize or 20)
   mainFrame.iconFrame:SetSize(iconSize, iconSize)
-  if cfg.showIcon then
-    mainFrame.iconFrame:Show()
+  mainFrame.iconFrame:ClearAllPoints()
+  if cfg.iconMovable and cfg.iconPosition then
+    local pos = cfg.iconPosition
+    mainFrame.iconFrame:SetPoint(
+      pos.point or "RIGHT", mainFrame, pos.relPoint or "LEFT",
+      pos.x or -2, pos.y or 0)
   else
-    mainFrame.iconFrame:Hide()
+    mainFrame.iconFrame:SetPoint("RIGHT", mainFrame, "LEFT", -2, 0)
+  end
+  -- Icon drag handle: visible only when options panel is open and iconMovable is enabled
+  if mainFrame.iconFrame.iconDragBtn then
+    if cfg.iconMovable and ns._arcUIOptionsOpen then
+      mainFrame.iconFrame.iconDragBtn:Show()
+    else
+      mainFrame.iconFrame.iconDragBtn:Hide()
+    end
   end
 
   -- Font
@@ -628,8 +691,8 @@ local StopCast
 -- ONUPDATE (only runs during an active cast)
 -- ===================================================================
 local function CastOnUpdate(self, elapsed)
-  local cfg = GetCastbarDB()
-    if not cfg then return end
+  local cfg = castCachedCfg
+  if not cfg then return end
     if castChannelEnded and castIsChannel and not castIsEmpowered then
       if (GetTime() - channelStopTime) > 0.01 then
         StopCast()
@@ -711,11 +774,15 @@ local function CastOnUpdate(self, elapsed)
     end
   end
 
-  -- Live countdown timer
+  -- Live countdown timer (throttled to 10fps — only rebuild string when 0.1s bucket changes)
   if cfg.showTimer then
     local remaining = castEndTime - now
     if remaining < 0 then remaining = 0 end
-    castTextFrame.timerText:SetText(string.format("%.1f", remaining))
+    local bucket = math.floor(remaining * 10)
+    if bucket ~= timerLastBucket then
+      timerLastBucket = bucket
+      castTextFrame.timerText:SetText(string.format("%.1f", remaining))
+    end
   end
 end
 
@@ -723,7 +790,9 @@ end
 -- SHOW / STOP CAST
 -- ===================================================================
 local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterruptible, isEmpowered, numStages, stageProps)
-    local cfg = GetCastbarDB()
+  local cfg = GetCastbarDB()
+  castCachedCfg   = cfg
+  timerLastBucket = -1
   if not cfg or not cfg.enabled then
     CastDebug("ShowCast blocked: castbar disabled (spellID=" .. tostring(spellID) .. ")")
     return
@@ -775,9 +844,13 @@ local function ShowCast(spellID, startTimeMS, endTimeMS, isChannel, notInterrupt
     mainFrame.iconFrame:Hide()
   end
 
-  -- Spell name
+  -- Spell name (optionally shortened)
   if cfg.showText then
-    textFrame.nameText:SetText(spellName or "")
+    local displayName = spellName or ""
+    if cfg.spellShortenEnabled and cfg.spellShortenLength and cfg.spellShortenLength > 0 then
+      displayName = ShortenSpellName(displayName, cfg.spellShortenLength)
+    end
+    textFrame.nameText:SetText(displayName)
   else
     textFrame.nameText:SetText("")
   end
@@ -825,6 +898,7 @@ end
 
 StopCast = function()
   castActive           = false
+  castCachedCfg        = nil
   castChannelEnded     = false
   castActiveSpellID    = 0
   castNotInterruptible = false
@@ -873,7 +947,16 @@ local function ShowPreview()
     mainFrame.fillBar:SetStatusBarColor(color.r, color.g, color.b, color.a or 1)
     mainFrame.fillBar:SetValue(0.6)
   end
-  mainFrame.iconFrame:Hide()
+  -- Show icon with a placeholder so it can be dragged while options are open
+  if cfg.showIcon then
+    mainFrame.iconTex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+    mainFrame.iconFrame:Show()
+    if cfg.iconMovable and mainFrame.iconFrame.iconDragBtn then
+      mainFrame.iconFrame.iconDragBtn:Show()
+    end
+  else
+    mainFrame.iconFrame:Hide()
+  end
 
   textFrame.nameText:SetText(cfg.showText and "Castbar Preview" or "")
   textFrame.timerText:SetText(cfg.showTimer and "1.2" or "")
@@ -909,18 +992,18 @@ ns.Castbar.HidePreview = HidePreview
 -- ===================================================================
 local castEventFrame = CreateFrame("Frame")
 castEventFrame:RegisterEvent("PLAYER_LOGIN")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_START")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_DELAYED")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_STOP")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_UPDATE")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_START")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
-castEventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_UPDATE")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_START",       "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_DELAYED",     "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_STOP",        "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED",      "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_INTERRUPTED", "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED",   "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START",  "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_STOP",   "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_UPDATE", "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_EMPOWER_START",  "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_EMPOWER_STOP",   "player")
+castEventFrame:RegisterUnitEvent("UNIT_SPELLCAST_EMPOWER_UPDATE", "player")
 castEventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 castEventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 castEventFrame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED")
