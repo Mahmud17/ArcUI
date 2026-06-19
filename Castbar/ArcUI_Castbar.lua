@@ -1304,6 +1304,7 @@ castEventFrame:SetScript("OnEvent", function(self, event, unit, castGUID, spellI
     local name, _, _, startTimeMS, endTimeMS, _, _, notInterruptible = UnitCastingInfo("player")
     CastDebug("SPELLCAST_START: spellID=" .. tostring(spellID) .. " name=" .. tostring(name))
     if name then
+      castCurrentGUID = castGUID
       ShowCast(spellID, startTimeMS, endTimeMS, false, notInterruptible)
     end
 
@@ -1434,6 +1435,9 @@ elseif event == "UNIT_SPELLCAST_CHANNEL_START"
     -- For channel/empower these fire for GCD rejections / queued spells, not the cast itself —
     -- CHANNEL_STOP / EMPOWER_STOP own their end. A hardcast that's still active here was cancelled.
     if castIsChannel or castIsEmpowered then return end
+    -- GUID guard: rejected/queued spell attempts fire STOP/FAILED with their own GUID, not the
+    -- active cast's. Only end the cast when the GUID matches what we started with.
+    if castGUID ~= castCurrentGUID then return end
     if castActive then EndCast(false) end
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
