@@ -10,16 +10,24 @@ local ADDON, ns = ...
 ns.AdvancedDebuffs = {}
 local AD = ns.AdvancedDebuffs
 
--- ── Dispel type atlas names (SpellDispelType DB2 indices) ─────────────────
--- Curse (2) and Enrage (9) have no RaidFrame atlas; they rely on border color only.
-local DISPEL_ATLAS = {
-    [1]  = "RaidFrame-Icon-DebuffMagic",
-    [3]  = "RaidFrame-Icon-DebuffDisease",
-    [4]  = "RaidFrame-Icon-DebuffPoison",
-    [11] = "RaidFrame-Icon-DebuffBleed",
+-- ── Dispel type colors and badge atlases (keyed by AuraData.dispelName string) ──
+-- dispelName is a non-secret string: "Magic", "Curse", "Disease", "Poison", "Enrage", "Bleed"
+local DISPEL_COLORS = {
+    Magic   = {0.2, 0.6, 1.0},
+    Curse   = {0.6, 0.0, 1.0},
+    Disease = {0.6, 0.4, 0.0},
+    Poison  = {0.0, 0.6, 0.0},
+    Enrage  = {1.0, 0.2, 0.0},
+    Bleed   = {1.0, 0.0, 0.0},
 }
--- All dispel indices used in the color curve (including those without badge icons)
-local ALL_DISPEL_INDICES = { 0, 1, 2, 3, 4, 9, 11 }
+-- Badge atlas icons keyed by dispelName (Enrage has no standard RaidFrame atlas)
+local DISPEL_ATLAS = {
+    Magic   = "RaidFrame-Icon-DebuffMagic",
+    Curse   = "RaidFrame-Icon-DebuffCurse",
+    Disease = "RaidFrame-Icon-DebuffDisease",
+    Poison  = "RaidFrame-Icon-DebuffPoison",
+    Bleed   = "RaidFrame-Icon-DebuffBleed",
+}
 
 local FILTER_NAMES = {
     "PLAYER", "RAID", "CROWD_CONTROL",
@@ -27,10 +35,6 @@ local FILTER_NAMES = {
 }
 
 local INSET = 2  -- border-strip width in pixels
-
--- ── Curves (initialised once at Init) ─────────────────────────────────────
-local dispelColorCurve = nil    -- debuff border: dispel-type index → RGBA color
-local dispelAlphaCurves = {}    -- [dispelIndex] = curve returning alpha=1 only for that type
 
 -- ── Active-tracker reference counter (shared event frame) ─────────────────
 local activeTrackerCount = 0
@@ -55,6 +59,17 @@ local extEnabled     = false
 
 local isInitialized  = false
 
+-- ── Preview mode ──────────────────────────────────────────────────────────────
+-- When the options panel is open and no real auras are active, we show placeholder
+-- icons for each dispel type so the user can see the visual style and frame position.
+local debuffPreviewActive = false
+local extPreviewActive    = false
+
+-- FileDataIDs for preview icons — stable cross-patch Blizzard textures (same set as NorskenUI)
+local PREVIEW_ICON_IDS    = { 136139, 136188, 132090, 135849, 132095, 136197 }
+-- Dispel type cycle for the debuff preview (nil = no type / generic icon)
+local PREVIEW_DISPEL_CYCLE = { "Magic", "Curse", "Disease", "Poison", "Bleed", "Enrage", nil, nil }
+
 -- ===================================================================
 -- DB ACCESSORS
 -- ===================================================================
@@ -67,6 +82,36 @@ end
 local function GetExtDB()
     local db = ns.API.GetDB and ns.API.GetDB()
     return db and db.advancedExternals
+end
+
+-- Bloodlust-family spell IDs to suppress by default (matches NorskenUI's DEFAULT_BLOCKLIST)
+local DEFAULT_BLACKLIST = {
+    [57723]  = true,   -- Exhaustion (Bloodlust)
+    [57724]  = true,   -- Sated (Heroism)
+    [80354]  = true,   -- Temporal Displacement (Time Warp – Mage)
+    [160455] = true,   -- Fatigued (Drums of Fury / Battle)
+    [390435] = true,   -- Exhaustion (variant)
+    [95809]  = true,   -- Exhaustion (variant)
+    [264689] = true,   -- Fatigued (variant)
+    [308312] = true,   -- Time Trial (Mythic+)
+}
+
+-- Ensures default entries are explicitly written to SavedVariables.
+-- AceDB's metatable makes db.blacklist[id] fall back to the defaults table (returning true)
+-- rather than nil, so the plain == nil check never fires and pairs() sees nothing.
+-- rawget bypasses the metatable and checks only what is actually in the saved table.
+local function ApplyDefaultBlacklist()
+    local db = GetDB()
+    if not db then return end
+    if not db.blacklist then db.blacklist = {} end
+    for id in pairs(DEFAULT_BLACKLIST) do
+        -- rawget: nil  = "never set" → write true so pairs() sees it in the UI
+        -- rawget: false = "user removed" → leave alone
+        -- rawget: true  = "already explicit" → leave alone
+        if rawget(db.blacklist, id) == nil then
+            db.blacklist[id] = true
+        end
+    end
 end
 
 -- ===================================================================
@@ -105,8 +150,14 @@ local function BuildFilterStrings(db)
     return out
 end
 
-local function ShouldShowAura(auraInstanceID, aura, filterStrings)
+local function ShouldShowAura(auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled)
     if not aura then return false end
+    -- Blacklist: spellId is secret in instances; guard with issecretvalue so it
+    -- filters correctly outside instances and safely skips the check inside.
+    if blacklistEnabled and blacklist then
+        local sid = aura.spellId
+        if sid and not issecretvalue(sid) and blacklist[sid] then return false end
+    end
     local base = C_UnitAuras.IsAuraFilteredOutByInstanceID("player", auraInstanceID, "HARMFUL")
     if not issecretvalue(base) and base then return false end
     for _, filter in ipairs(filterStrings) do
@@ -132,6 +183,24 @@ end
 
 local function SortAuras(a, b)
     return a.auraInstanceID < b.auraInstanceID
+end
+
+-- Resize 'frame' to exactly contain the visible icon grid so dragging works.
+local function ResizeFrame(pool, frame, db)
+    local visible = 0
+    for _, btn in ipairs(pool) do
+        if btn:IsShown() then visible = visible + 1 end
+    end
+    if visible == 0 then frame:SetSize(1, 1); return end
+    local size    = db.iconSize    or 40
+    local spacing = db.iconSpacing or 4
+    local perRow  = db.iconsPerRow or 8
+    local cols    = math.min(visible, perRow)
+    local rows    = math.ceil(visible / perRow)
+    frame:SetSize(
+        cols * size + math.max(0, cols - 1) * spacing,
+        rows * size + math.max(0, rows - 1) * spacing
+    )
 end
 
 -- Position all shown pool buttons in a grid anchored to 'frame'.
@@ -162,41 +231,67 @@ end
 -- ===================================================================
 
 -- Apply dispel or custom border color via SetVertexColor (safe sink).
-local function ApplyDebuffBorderColor(button, auraInstanceID, db)
+-- dispelName is a non-secret string field from AuraData ("Magic", "Curse", etc.)
+local function ApplyDebuffBorderColor(button, dispelName, db)
     if not button.borderBg then return end
-    if db.borderColorMode == "dispel" and dispelColorCurve then
-        local color = C_UnitAuras.GetAuraDispelTypeColor("player", auraInstanceID, dispelColorCurve)
-        if color then
-            button.borderBg:SetVertexColor(color:GetRGBA())
-        else
-            button.borderBg:SetVertexColor(0.5, 0.5, 0.5, 0.4)
-        end
+    if db.borderColorMode ~= "custom" then
+        local c = DISPEL_COLORS[dispelName] or {0.5, 0.5, 0.5}
+        button.borderBg:SetVertexColor(c[1], c[2], c[3], 1.0)
     else
         local bc = db.borderColor or { r=0.8, g=0.8, b=0.8, a=1 }
         button.borderBg:SetVertexColor(bc.r, bc.g, bc.b, bc.a)
     end
 end
 
--- Show/hide the small dispel-type badge icons via per-type alpha curves.
--- GetAuraDispelTypeColor returns a secret ColorMixin; alpha component is safe sink.
-local function UpdateDispelIcons(button, auraInstanceID)
+-- Show the badge icon matching this aura's dispel type; hide all others.
+local function UpdateDispelIcons(button, dispelName)
     if not button.dispelIcons then return end
-    for dispelIndex, icon in pairs(button.dispelIcons) do
-        local curve = dispelAlphaCurves[dispelIndex]
-        if curve then
-            local color = C_UnitAuras.GetAuraDispelTypeColor("player", auraInstanceID, curve)
-            if color then
-                local _, _, _, a = color:GetRGBA()
-                icon:SetAlpha(a)   -- secret alpha via safe sink
-            else
-                icon:SetAlpha(0)
-            end
-        end
+    for dn, icon in pairs(button.dispelIcons) do
+        icon:SetAlpha(dn == dispelName and 1 or 0)
     end
 end
 
+-- ===================================================================
+-- BORDER WIDTH AND GLOW HELPERS
+-- ===================================================================
+
+local function ApplyBorderWidth(btn, inset)
+    btn.icon:ClearAllPoints()
+    btn.icon:SetPoint("TOPLEFT",     btn, "TOPLEFT",      inset, -inset)
+    btn.icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset,  inset)
+    btn.cooldown:ClearAllPoints()
+    btn.cooldown:SetPoint("TOPLEFT",     btn, "TOPLEFT",      inset, -inset)
+    btn.cooldown:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset,  inset)
+end
+
+local GLOW_KEY = "_arcAdGlow"
+
+local function ApplyIconGlow(button, r, g, b, db)
+    if not ns.Glows then return end
+    ns.Glows.Start(button, GLOW_KEY, "pixel", {
+        color     = { r, g, b, 1 },
+        thickness = (db and db.glowWidth) or 2,
+        lines     = 8,
+        frequency = 0.25,
+    })
+end
+
+local function RemoveIconGlow(button)
+    if not ns.Glows then return end
+    ns.Glows.Stop(button, GLOW_KEY)
+end
+
+local function ResolveRelFrame(pos)
+    local name = pos and pos.relativeFrame
+    if name and name ~= "UIParent" then
+        local f = _G[name]
+        if f then return f end
+    end
+    return UIParent
+end
+
 local function UpdateDebuffButton(button, data, db)
-    if not data then button:Hide(); return end
+    if not data then RemoveIconGlow(button); button:Hide(); return end
     button.auraInstanceID = data.auraInstanceID
     button.icon:SetTexture(data.icon)   -- secret → SetTexture safe sink
     local count = C_UnitAuras.GetAuraApplicationDisplayCount("player", data.auraInstanceID, 2, 999)
@@ -208,8 +303,20 @@ local function UpdateDebuffButton(button, data, db)
     else
         button.cooldown:Hide()
     end
-    ApplyDebuffBorderColor(button, data.auraInstanceID, db)
-    UpdateDispelIcons(button, data.auraInstanceID)
+    local dispelName = data.dispelName  -- non-secret string: "Magic", "Curse", "Disease", etc.
+    ApplyDebuffBorderColor(button, dispelName, db)
+    UpdateDispelIcons(button, dispelName)
+    if db.borderGlow then
+        if db.borderColorMode ~= "custom" then
+            local c = DISPEL_COLORS[dispelName] or {0.5, 0.5, 0.5}
+            ApplyIconGlow(button, c[1], c[2], c[3], db)
+        else
+            local bc = db.borderColor or {r=0.8,g=0.8,b=0.8,a=1}
+            ApplyIconGlow(button, bc.r, bc.g, bc.b, db)
+        end
+    else
+        RemoveIconGlow(button)
+    end
     button:Show()
 end
 
@@ -218,7 +325,7 @@ end
 -- ===================================================================
 
 local function UpdateExtButton(button, data, db)
-    if not data then button:Hide(); return end
+    if not data then RemoveIconGlow(button); button:Hide(); return end
     button.auraInstanceID = data.auraInstanceID
     button.icon:SetTexture(data.icon)
     local count = C_UnitAuras.GetAuraApplicationDisplayCount("player", data.auraInstanceID, 2, 999)
@@ -230,9 +337,14 @@ local function UpdateExtButton(button, data, db)
     else
         button.cooldown:Hide()
     end
+    local bc = db.borderColor or { r=0.2, g=0.8, b=0.2, a=1 }
     if button.borderBg then
-        local bc = db.borderColor or { r=0.2, g=0.8, b=0.2, a=1 }
         button.borderBg:SetVertexColor(bc.r, bc.g, bc.b, bc.a)
+    end
+    if db.borderGlow then
+        ApplyIconGlow(button, bc.r, bc.g, bc.b, db)
+    else
+        RemoveIconGlow(button)
     end
     button:Show()
 end
@@ -243,6 +355,7 @@ end
 
 local function CreateDebuffButton(parent, db)
     local size   = db.iconSize or 40
+    local inset  = db.borderWidth or INSET
     local button = CreateFrame("Frame", nil, parent)
     button:SetSize(size, size)
 
@@ -255,13 +368,13 @@ local function CreateDebuffButton(parent, db)
     button.borderBg:SetColorTexture(1, 1, 1, 1)
 
     button.icon = button:CreateTexture(nil, "ARTWORK")
-    button.icon:SetPoint("TOPLEFT",     button, "TOPLEFT",      INSET, -INSET)
-    button.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -INSET,  INSET)
+    button.icon:SetPoint("TOPLEFT",     button, "TOPLEFT",      inset, -inset)
+    button.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -inset,  inset)
     button.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
     button.cooldown = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
-    button.cooldown:SetPoint("TOPLEFT",     button, "TOPLEFT",      INSET, -INSET)
-    button.cooldown:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -INSET,  INSET)
+    button.cooldown:SetPoint("TOPLEFT",     button, "TOPLEFT",      inset, -inset)
+    button.cooldown:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -inset,  inset)
     button.cooldown:SetDrawEdge(false)
     button.cooldown:SetDrawSwipe(db.showSwipe ~= false)
     button.cooldown:SetReverse(db.reverseSwipe ~= false)
@@ -272,23 +385,36 @@ local function CreateDebuffButton(parent, db)
     button.count:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
     button.count:SetJustifyH("RIGHT")
 
-    -- Dispel-type badge icons (one per type with atlas icon; alpha driven by per-type curve)
+    -- Dispel-type badge icons (one per type; shown/hidden by matching dispelName)
     local dispelOverlay = CreateFrame("Frame", nil, button)
     dispelOverlay:SetAllPoints()
     dispelOverlay:SetFrameLevel(button.cooldown:GetFrameLevel() + 1)
 
     button.dispelIcons = {}
-    for dispelIndex, atlas in pairs(DISPEL_ATLAS) do
+    for dispelName, atlas in pairs(DISPEL_ATLAS) do
         local icon = dispelOverlay:CreateTexture(nil, "OVERLAY")
         icon:SetSize(12, 12)
         icon:SetPoint("TOPRIGHT", button, "TOPRIGHT", 0, 0)
         icon:SetAtlas(atlas)
         icon:SetAlpha(0)
-        button.dispelIcons[dispelIndex] = icon
+        button.dispelIcons[dispelName] = icon
     end
 
+    -- Always enable mouse so drag passthrough works; suppress clicks.
     local showTips = db.showTooltips
-    button:EnableMouse(showTips)
+    button:EnableMouse(true)
+    button:RegisterForDrag("LeftButton")
+    button:SetScript("OnDragStart", function() parent:StartMoving() end)
+    button:SetScript("OnDragStop", function()
+        parent:StopMovingOrSizing()
+        local point, _, relPoint, x, y = parent:GetPoint(1)
+        local d = ns.API.GetDB and ns.API.GetDB()
+        if d and d.advancedDebuffs then
+            d.advancedDebuffs.position = {
+                point=point or "CENTER", relativePoint=relPoint or "CENTER", x=x or 0, y=y or 0,
+            }
+        end
+    end)
     if button.SetMouseClickEnabled  then button:SetMouseClickEnabled(false)  end
     if button.SetMouseMotionEnabled then button:SetMouseMotionEnabled(showTips) end
     if showTips then
@@ -313,6 +439,7 @@ end
 
 local function CreateExtButton(parent, db)
     local size   = db.iconSize or 40
+    local inset  = db.borderWidth or INSET
     local button = CreateFrame("Frame", nil, parent)
     button:SetSize(size, size)
 
@@ -325,13 +452,13 @@ local function CreateExtButton(parent, db)
     button.borderBg:SetColorTexture(1, 1, 1, 1)
 
     button.icon = button:CreateTexture(nil, "ARTWORK")
-    button.icon:SetPoint("TOPLEFT",     button, "TOPLEFT",      INSET, -INSET)
-    button.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -INSET,  INSET)
+    button.icon:SetPoint("TOPLEFT",     button, "TOPLEFT",      inset, -inset)
+    button.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -inset,  inset)
     button.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
     button.cooldown = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
-    button.cooldown:SetPoint("TOPLEFT",     button, "TOPLEFT",      INSET, -INSET)
-    button.cooldown:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -INSET,  INSET)
+    button.cooldown:SetPoint("TOPLEFT",     button, "TOPLEFT",      inset, -inset)
+    button.cooldown:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -inset,  inset)
     button.cooldown:SetDrawEdge(false)
     button.cooldown:SetDrawSwipe(db.showSwipe ~= false)
     button.cooldown:SetReverse(db.reverseSwipe ~= false)
@@ -343,7 +470,19 @@ local function CreateExtButton(parent, db)
     button.count:SetJustifyH("RIGHT")
 
     local showTips = db.showTooltips
-    button:EnableMouse(showTips)
+    button:EnableMouse(true)
+    button:RegisterForDrag("LeftButton")
+    button:SetScript("OnDragStart", function() parent:StartMoving() end)
+    button:SetScript("OnDragStop", function()
+        parent:StopMovingOrSizing()
+        local point, _, relPoint, x, y = parent:GetPoint(1)
+        local d = ns.API.GetDB and ns.API.GetDB()
+        if d and d.advancedExternals then
+            d.advancedExternals.position = {
+                point=point or "CENTER", relativePoint=relPoint or "CENTER", x=x or 0, y=y or 0,
+            }
+        end
+    end)
     if button.SetMouseClickEnabled  then button:SetMouseClickEnabled(false)  end
     if button.SetMouseMotionEnabled then button:SetMouseMotionEnabled(showTips) end
     if showTips then
@@ -363,6 +502,91 @@ local function CreateExtButton(parent, db)
 end
 
 -- ===================================================================
+-- PREVIEW (shown when panel is open and no real auras are active)
+-- ===================================================================
+
+local function ShowDebuffPreview()
+    if not mainFrame or not isEnabled then return end
+    local db    = GetDB()
+    if not db then return end
+    local count = (db.iconsPerRow or 8) * (db.maxRows or 2)
+    while #buttonPool < count do CreateDebuffButton(mainFrame, db) end
+    local now = GetTime()
+    for i = 1, count do
+        local btn        = buttonPool[i]
+        local iconIdx    = ((i - 1) % #PREVIEW_ICON_IDS)    + 1
+        local dispelIdx  = ((i - 1) % #PREVIEW_DISPEL_CYCLE) + 1
+        local dispelName = PREVIEW_DISPEL_CYCLE[dispelIdx]
+        btn.icon:SetTexture(PREVIEW_ICON_IDS[iconIdx])
+        -- Fake stack counts (same pattern as NorskenUI)
+        if     i % 4 == 1 then btn.count:SetText(2)
+        elseif i % 4 == 2 then btn.count:SetText(5)
+        else                    btn.count:SetText("") end
+        -- Fake cooldown swipes with locally-computed non-secret values
+        if i % 3 ~= 0 then
+            local dur   = 20 + ((i * 5) % 30)
+            local start = now - (dur * (0.2 + (i % 5) * 0.1))
+            btn.cooldown:SetCooldown(start, dur)
+            btn.cooldown:Show()
+        else
+            btn.cooldown:Hide()
+        end
+        ApplyDebuffBorderColor(btn, dispelName, db)
+        UpdateDispelIcons(btn, dispelName)
+        if db.borderGlow then
+            if db.borderColorMode ~= "custom" then
+                local c = DISPEL_COLORS[dispelName] or {0.5, 0.5, 0.5}
+                ApplyIconGlow(btn, c[1], c[2], c[3], db)
+            else
+                local bc = db.borderColor or {r=0.8,g=0.8,b=0.8,a=1}
+                ApplyIconGlow(btn, bc.r, bc.g, bc.b, db)
+            end
+        else
+            RemoveIconGlow(btn)
+        end
+        btn:Show()
+    end
+    for i = count + 1, #buttonPool do buttonPool[i]:Hide() end
+    PositionPool(buttonPool, mainFrame, db)
+    ResizeFrame(buttonPool, mainFrame, db)
+end
+
+local function ShowExtPreview()
+    if not extFrame or not extEnabled then return end
+    local db    = GetExtDB()
+    if not db then return end
+    local count = (db.iconsPerRow or 8) * (db.maxRows or 1)
+    while #extPool < count do CreateExtButton(extFrame, db) end
+    local now = GetTime()
+    local bc  = db.borderColor or { r=0.2, g=0.8, b=0.2, a=1 }
+    for i = 1, count do
+        local btn = extPool[i]
+        btn.icon:SetTexture(PREVIEW_ICON_IDS[((i - 1) % #PREVIEW_ICON_IDS) + 1])
+        if     i % 4 == 1 then btn.count:SetText(2)
+        elseif i % 4 == 2 then btn.count:SetText(5)
+        else                    btn.count:SetText("") end
+        if i % 3 ~= 0 then
+            local dur   = 20 + ((i * 5) % 30)
+            local start = now - (dur * (0.2 + (i % 5) * 0.1))
+            btn.cooldown:SetCooldown(start, dur)
+            btn.cooldown:Show()
+        else
+            btn.cooldown:Hide()
+        end
+        if btn.borderBg then btn.borderBg:SetVertexColor(bc.r, bc.g, bc.b, bc.a) end
+        if db.borderGlow then
+            ApplyIconGlow(btn, bc.r, bc.g, bc.b, db)
+        else
+            RemoveIconGlow(btn)
+        end
+        btn:Show()
+    end
+    for i = count + 1, #extPool do extPool[i]:Hide() end
+    PositionPool(extPool, extFrame, db)
+    ResizeFrame(extPool, extFrame, db)
+end
+
+-- ===================================================================
 -- DEBUFFS — AURA REFRESH
 -- ===================================================================
 
@@ -374,7 +598,9 @@ function AD.RefreshAllAuras()
     wipe(auraCache)
     wipe(activeAuras)
 
-    local filterStrings = BuildFilterStrings(db)
+    local filterStrings    = BuildFilterStrings(db)
+    local blacklist        = db.blacklist
+    local blacklistEnabled = db.blacklistEnabled ~= false
     local ids = C_UnitAuras.GetUnitAuraInstanceIDs("player", "HARMFUL")
     if not ids then
         for _, btn in ipairs(buttonPool) do btn:Hide() end
@@ -384,7 +610,7 @@ function AD.RefreshAllAuras()
     local count = 0
     for _, id in ipairs(ids) do
         local aura = C_UnitAuras.GetAuraDataByAuraInstanceID("player", id)
-        if aura and ShouldShowAura(id, aura, filterStrings) then
+        if aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled) then
             activeAuras[id] = true
             count = count + 1
             auraCache[count] = aura
@@ -405,6 +631,9 @@ function AD.RefreshAllAuras()
     end
 
     PositionPool(buttonPool, mainFrame, db)
+    ResizeFrame(buttonPool, mainFrame, db)
+
+    if debuffPreviewActive and count == 0 then ShowDebuffPreview() end
 end
 
 local function QueueFullRefresh()
@@ -420,8 +649,10 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     if not mainFrame or not isEnabled then return end
     local db = GetDB()
     if not db then return end
-    local filterStrings = BuildFilterStrings(db)
-    local changed = false
+    local filterStrings    = BuildFilterStrings(db)
+    local blacklist        = db.blacklist
+    local blacklistEnabled = db.blacklistEnabled ~= false
+    local changed          = false
 
     if removedIDs then
         for _, id in ipairs(removedIDs) do
@@ -430,7 +661,7 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     end
     if addedAuras then
         for _, aura in ipairs(addedAuras) do
-            if ShouldShowAura(aura.auraInstanceID, aura, filterStrings) then
+            if ShouldShowAura(aura.auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled) then
                 activeAuras[aura.auraInstanceID] = true; changed = true
             end
         end
@@ -438,7 +669,7 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     if updatedIDs then
         for _, id in ipairs(updatedIDs) do
             local aura      = C_UnitAuras.GetAuraDataByAuraInstanceID("player", id)
-            local should    = aura and ShouldShowAura(id, aura, filterStrings)
+            local should    = aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled)
             local was       = activeAuras[id]
             if should and not was then
                 activeAuras[id] = true; changed = true
@@ -464,30 +695,34 @@ function AD.RefreshExternals()
 
     wipe(extCache)
 
-    local seen  = {}
-    local count = 0
+    local seen           = {}
+    local count          = 0
+    local blacklist      = db.blacklist
+    local blacklistEnabled = db.blacklistEnabled ~= false
+
+    local function tryAdd(data)
+        if not data then return end
+        if seen[data.auraInstanceID] then return end
+        if blacklistEnabled and blacklist then
+            local sid = data.spellId
+            if sid and not issecretvalue(sid) and blacklist[sid] then return end
+        end
+        seen[data.auraInstanceID] = true
+        count = count + 1
+        extCache[count] = data
+    end
 
     -- Primary: external defensives cast on the player by others
     local slots = { C_UnitAuras.GetAuraSlots("player", "HELPFUL|EXTERNAL_DEFENSIVE") }
     for i = 2, #slots do
-        local data = C_UnitAuras.GetAuraDataBySlot("player", slots[i])
-        if data and not seen[data.auraInstanceID] then
-            seen[data.auraInstanceID] = true
-            count = count + 1
-            extCache[count] = data
-        end
+        tryAdd(C_UnitAuras.GetAuraDataBySlot("player", slots[i]))
     end
 
     -- Optional: big defensive cooldowns (includes self-cast defensive CDs)
     if db.showBigDefensives then
         local bigSlots = { C_UnitAuras.GetAuraSlots("player", "HELPFUL|BIG_DEFENSIVE") }
         for i = 2, #bigSlots do
-            local data = C_UnitAuras.GetAuraDataBySlot("player", bigSlots[i])
-            if data and not seen[data.auraInstanceID] then
-                seen[data.auraInstanceID] = true
-                count = count + 1
-                extCache[count] = data
-            end
+            tryAdd(C_UnitAuras.GetAuraDataBySlot("player", bigSlots[i]))
         end
     end
 
@@ -505,6 +740,9 @@ function AD.RefreshExternals()
     end
 
     PositionPool(extPool, extFrame, db)
+    ResizeFrame(extPool, extFrame, db)
+
+    if extPreviewActive and count == 0 then ShowExtPreview() end
 end
 
 local function QueueExtRefresh()
@@ -554,8 +792,9 @@ function AD.ApplyPosition()
     local db = GetDB()
     if not db then return end
     local pos = db.position or { point="CENTER", relativePoint="CENTER", x=0, y=-200 }
+    local relFrame = ResolveRelFrame(pos)
     mainFrame:ClearAllPoints()
-    mainFrame:SetPoint(pos.point or "CENTER", UIParent, pos.relativePoint or "CENTER",
+    mainFrame:SetPoint(pos.point or "CENTER", relFrame, pos.relativePoint or "CENTER",
         pos.x or 0, pos.y or -200)
     mainFrame:SetFrameStrata(db.strata or "MEDIUM")
 end
@@ -567,9 +806,11 @@ function AD.ApplySettings()
     if not db.enabled and isEnabled then AD.Disable(); return end
     if not mainFrame then return end
 
-    local size = db.iconSize or 40
+    local size  = db.iconSize or 40
+    local inset = db.borderWidth or INSET
     for btn in pairs(buttons) do
         btn:SetSize(size, size)
+        ApplyBorderWidth(btn, inset)
         local showTips = db.showTooltips
         btn:EnableMouse(showTips)
         if btn.SetMouseMotionEnabled then btn:SetMouseMotionEnabled(showTips) end
@@ -577,6 +818,7 @@ function AD.ApplySettings()
             btn.cooldown:SetDrawSwipe(db.showSwipe ~= false)
             btn.cooldown:SetReverse(db.reverseSwipe ~= false)
         end
+        if not db.borderGlow then RemoveIconGlow(btn) end
     end
 
     AD.ApplyPosition()
@@ -592,8 +834,9 @@ function AD.ApplyExtPosition()
     local db = GetExtDB()
     if not db then return end
     local pos = db.position or { point="CENTER", relativePoint="CENTER", x=0, y=-260 }
+    local relFrame = ResolveRelFrame(pos)
     extFrame:ClearAllPoints()
-    extFrame:SetPoint(pos.point or "CENTER", UIParent, pos.relativePoint or "CENTER",
+    extFrame:SetPoint(pos.point or "CENTER", relFrame, pos.relativePoint or "CENTER",
         pos.x or 0, pos.y or -260)
     extFrame:SetFrameStrata(db.strata or "MEDIUM")
 end
@@ -605,9 +848,11 @@ function AD.ApplyExtSettings()
     if not db.enabled and extEnabled then AD.DisableExternals(); return end
     if not extFrame then return end
 
-    local size = db.iconSize or 40
+    local size  = db.iconSize or 40
+    local inset = db.borderWidth or INSET
     for btn in pairs(extButtons) do
         btn:SetSize(size, size)
+        ApplyBorderWidth(btn, inset)
         local showTips = db.showTooltips
         btn:EnableMouse(showTips)
         if btn.SetMouseMotionEnabled then btn:SetMouseMotionEnabled(showTips) end
@@ -615,6 +860,7 @@ function AD.ApplyExtSettings()
             btn.cooldown:SetDrawSwipe(db.showSwipe ~= false)
             btn.cooldown:SetReverse(db.reverseSwipe ~= false)
         end
+        if not db.borderGlow then RemoveIconGlow(btn) end
     end
 
     AD.ApplyExtPosition()
@@ -644,8 +890,56 @@ local function CreateMainFrame()
             }
         end
     end)
+
+    -- Drag bar: shown when options panel is open so the frame is visible/draggable
+    local db = CreateFrame("Button", nil, mainFrame, "BackdropTemplate")
+    db:SetSize(160, 16)
+    db:SetFrameStrata("HIGH")
+    db:SetFrameLevel(100)
+    db:SetPoint("BOTTOMLEFT", mainFrame, "TOPLEFT", 0, 2)
+    db:SetClampedToScreen(true)
+    db:SetBackdrop({ bgFile="Interface\\Buttons\\WHITE8x8", edgeFile="Interface\\Buttons\\WHITE8x8", edgeSize=1 })
+    db:SetBackdropColor(0.12, 0.12, 0.12, 0.92)
+    db:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
+    local dbIcon = db:CreateTexture(nil, "OVERLAY")
+    dbIcon:SetSize(10, 10)
+    dbIcon:SetPoint("LEFT", db, "LEFT", 4, 0)
+    dbIcon:SetTexture("Interface\\CURSOR\\UI-Cursor-Move")
+    dbIcon:SetVertexColor(0.7, 0.7, 0.7, 1)
+    local dbLabel = db:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    dbLabel:SetPoint("LEFT", dbIcon, "RIGHT", 4, 0)
+    dbLabel:SetPoint("RIGHT", db, "RIGHT", -4, 0)
+    dbLabel:SetText("|cffffd100Advanced Debuffs|r")
+    dbLabel:SetJustifyH("LEFT")
+    db:EnableMouse(true)
+    db:RegisterForDrag("LeftButton")
+    db:SetScript("OnDragStart", function()
+        if InCombatLockdown() then return end
+        db:SetBackdropColor(0.12, 0.30, 0.55, 0.95)
+        db:SetBackdropBorderColor(0.25, 0.65, 1.0, 1)
+        dbIcon:SetVertexColor(1, 1, 1, 1)
+        mainFrame:StartMoving()
+    end)
+    db:SetScript("OnDragStop", function()
+        mainFrame:StopMovingOrSizing()
+        db:SetBackdropColor(0.12, 0.12, 0.12, 0.92)
+        db:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
+        dbIcon:SetVertexColor(0.7, 0.7, 0.7, 1)
+        local point, _, relPoint, x, y = mainFrame:GetPoint(1)
+        local d2 = ns.API.GetDB and ns.API.GetDB()
+        if d2 and d2.advancedDebuffs then
+            d2.advancedDebuffs.position = {
+                point=point or "CENTER", relativePoint=relPoint or "CENTER", x=x or 0, y=y or 0,
+            }
+        end
+    end)
+    db:Hide()
+    mainFrame._dragBar = db
+
     AD.ApplyPosition()
     mainFrame:Show()
+    -- Show drag bar immediately if panel is already open
+    if ns.optionsPanelOpen then db:Show() end
 end
 
 local function CreateExtFrame()
@@ -667,8 +961,56 @@ local function CreateExtFrame()
             }
         end
     end)
+
+    -- Drag bar: shown when options panel is open
+    local eb = CreateFrame("Button", nil, extFrame, "BackdropTemplate")
+    eb:SetSize(130, 16)
+    eb:SetFrameStrata("HIGH")
+    eb:SetFrameLevel(100)
+    eb:SetPoint("BOTTOMLEFT", extFrame, "TOPLEFT", 0, 2)
+    eb:SetClampedToScreen(true)
+    eb:SetBackdrop({ bgFile="Interface\\Buttons\\WHITE8x8", edgeFile="Interface\\Buttons\\WHITE8x8", edgeSize=1 })
+    eb:SetBackdropColor(0.12, 0.12, 0.12, 0.92)
+    eb:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
+    local ebIcon = eb:CreateTexture(nil, "OVERLAY")
+    ebIcon:SetSize(10, 10)
+    ebIcon:SetPoint("LEFT", eb, "LEFT", 4, 0)
+    ebIcon:SetTexture("Interface\\CURSOR\\UI-Cursor-Move")
+    ebIcon:SetVertexColor(0.7, 0.7, 0.7, 1)
+    local ebLabel = eb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    ebLabel:SetPoint("LEFT", ebIcon, "RIGHT", 4, 0)
+    ebLabel:SetPoint("RIGHT", eb, "RIGHT", -4, 0)
+    ebLabel:SetText("|cffffd100Externals|r")
+    ebLabel:SetJustifyH("LEFT")
+    eb:EnableMouse(true)
+    eb:RegisterForDrag("LeftButton")
+    eb:SetScript("OnDragStart", function()
+        if InCombatLockdown() then return end
+        eb:SetBackdropColor(0.12, 0.30, 0.55, 0.95)
+        eb:SetBackdropBorderColor(0.25, 0.65, 1.0, 1)
+        ebIcon:SetVertexColor(1, 1, 1, 1)
+        extFrame:StartMoving()
+    end)
+    eb:SetScript("OnDragStop", function()
+        extFrame:StopMovingOrSizing()
+        eb:SetBackdropColor(0.12, 0.12, 0.12, 0.92)
+        eb:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
+        ebIcon:SetVertexColor(0.7, 0.7, 0.7, 1)
+        local point, _, relPoint, x, y = extFrame:GetPoint(1)
+        local d2 = ns.API.GetDB and ns.API.GetDB()
+        if d2 and d2.advancedExternals then
+            d2.advancedExternals.position = {
+                point=point or "CENTER", relativePoint=relPoint or "CENTER", x=x or 0, y=y or 0,
+            }
+        end
+    end)
+    eb:Hide()
+    extFrame._dragBar = eb
+
     AD.ApplyExtPosition()
     extFrame:Show()
+    -- Show drag bar immediately if panel is already open
+    if ns.optionsPanelOpen then eb:Show() end
 end
 
 -- ===================================================================
@@ -688,7 +1030,7 @@ function AD.Disable()
     isEnabled = false
     ReleaseEvents()
     if mainFrame then mainFrame:Hide() end
-    for _, btn in ipairs(buttonPool) do btn:Hide() end
+    for _, btn in ipairs(buttonPool) do RemoveIconGlow(btn); btn:Hide() end
 end
 
 function AD.EnableExternals()
@@ -704,37 +1046,7 @@ function AD.DisableExternals()
     extEnabled = false
     ReleaseEvents()
     if extFrame then extFrame:Hide() end
-    for _, btn in ipairs(extPool) do btn:Hide() end
-end
-
--- ===================================================================
--- CURVE INIT
--- ===================================================================
-
-local function InitDispelCurves()
-    -- Border color curve: dispel-type index → RGBA border color
-    dispelColorCurve = C_CurveUtil.CreateColorCurve()
-    dispelColorCurve:SetType(Enum.LuaCurveType.Step)
-    dispelColorCurve:AddPoint(0,  CreateColor(0.5, 0.5, 0.5, 0.35))  -- None
-    dispelColorCurve:AddPoint(1,  CreateColor(0.2, 0.6, 1.0, 1.0))   -- Magic
-    dispelColorCurve:AddPoint(2,  CreateColor(0.6, 0.0, 1.0, 1.0))   -- Curse
-    dispelColorCurve:AddPoint(3,  CreateColor(0.6, 0.4, 0.0, 1.0))   -- Disease
-    dispelColorCurve:AddPoint(4,  CreateColor(0.0, 0.6, 0.0, 1.0))   -- Poison
-    dispelColorCurve:AddPoint(9,  CreateColor(1.0, 0.2, 0.0, 1.0))   -- Enrage
-    dispelColorCurve:AddPoint(11, CreateColor(1.0, 0.0, 0.0, 1.0))   -- Bleed
-
-    -- Alpha curves: one per atlas-bearing dispel type.
-    -- Each returns alpha=1 only when the aura matches that specific dispel type.
-    local transparent = CreateColor(1, 1, 1, 0)
-    local visible     = CreateColor(1, 1, 1, 1)
-    for dispelIndex in pairs(DISPEL_ATLAS) do
-        local curve = C_CurveUtil.CreateColorCurve()
-        curve:SetType(Enum.LuaCurveType.Step)
-        for _, idx in ipairs(ALL_DISPEL_INDICES) do
-            curve:AddPoint(idx, idx == dispelIndex and visible or transparent)
-        end
-        dispelAlphaCurves[dispelIndex] = curve
-    end
+    for _, btn in ipairs(extPool) do RemoveIconGlow(btn); btn:Hide() end
 end
 
 -- ===================================================================
@@ -744,9 +1056,33 @@ end
 function AD.Init()
     if isInitialized then return end
     isInitialized = true
-    InitDispelCurves()
+    ApplyDefaultBlacklist()  -- seed BL entries for existing saves that have an empty blacklist
     local db = GetDB()
     if db and db.enabled then AD.Enable() end
     local edb = GetExtDB()
     if edb and edb.enabled then AD.EnableExternals() end
+
+    -- Show drag bars and preview icons when ArcUI options panel opens; clean up on close
+    if ns.CDMShared and ns.CDMShared.RegisterPanelCallback then
+        ns.CDMShared.RegisterPanelCallback("AdvancedDebuffs", {
+            onOpen = function()
+                debuffPreviewActive = true
+                extPreviewActive    = true
+                if mainFrame and mainFrame._dragBar then mainFrame._dragBar:Show() end
+                if extFrame  and extFrame._dragBar  then extFrame._dragBar:Show()  end
+                -- Refresh so preview kicks in if no real auras are active
+                if mainFrame and isEnabled  then QueueFullRefresh() end
+                if extFrame  and extEnabled then QueueExtRefresh()  end
+            end,
+            onClose = function()
+                debuffPreviewActive = false
+                extPreviewActive    = false
+                if mainFrame and mainFrame._dragBar then mainFrame._dragBar:Hide() end
+                if extFrame  and extFrame._dragBar  then extFrame._dragBar:Hide()  end
+                -- Refresh to clear preview icons; real auras take over naturally
+                if mainFrame and isEnabled  then QueueFullRefresh() end
+                if extFrame  and extEnabled then QueueExtRefresh()  end
+            end,
+        })
+    end
 end

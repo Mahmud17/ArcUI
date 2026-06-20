@@ -715,8 +715,11 @@ ns.DB_DEFAULTS = {
       growVertical = "DOWN",
       borderColorMode = "dispel",
       borderColor = { r=0.8, g=0.8, b=0.8, a=1 },
+      borderWidth = 2,
+      borderGlow = false,
+      glowWidth = 2,
       strata = "MEDIUM",
-      position = { point="CENTER", relativePoint="CENTER", x=0, y=-200 },
+      position = { point="CENTER", relativePoint="CENTER", x=0, y=-200, relativeFrame="UIParent" },
       filters = {
         PLAYER = false,
         RAID = false,
@@ -724,6 +727,18 @@ ns.DB_DEFAULTS = {
         RAID_IN_COMBAT = false,
         RAID_PLAYER_DISPELLABLE = false,
         IMPORTANT = false,
+      },
+      blacklistEnabled = true,
+      blacklist = {
+        -- Bloodlust / Heroism family — pre-populated to match NorskenUI defaults
+        [57723]  = true,   -- Exhaustion (Bloodlust)
+        [57724]  = true,   -- Sated (Heroism)
+        [80354]  = true,   -- Temporal Displacement (Time Warp – Mage)
+        [160455] = true,   -- Fatigued (Drums of Fury / Battle)
+        [390435] = true,   -- Exhaustion (variant / Warlords-era token)
+        [95809]  = true,   -- Exhaustion (variant)
+        [264689] = true,   -- Fatigued (variant)
+        [308312] = true,   -- Time Trial (Mythic+ BL mechanic)
       },
     },
 
@@ -739,9 +754,14 @@ ns.DB_DEFAULTS = {
       growHorizontal = "RIGHT",
       growVertical = "DOWN",
       borderColor = { r=0.2, g=0.8, b=0.2, a=1 },
+      borderWidth = 2,
+      borderGlow = false,
+      glowWidth = 2,
       strata = "MEDIUM",
-      position = { point="CENTER", relativePoint="CENTER", x=0, y=-260 },
+      position = { point="CENTER", relativePoint="CENTER", x=0, y=-260, relativeFrame="UIParent" },
       showBigDefensives = false,
+      blacklistEnabled = true,
+      blacklist = {},
     },
 
     configVersion = 1
