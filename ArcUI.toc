@@ -59,6 +59,13 @@ ArcUI_Options.lua
 # Changelog ("What's New" window)
 ArcUI_Changelog.lua
 
+# Custom GUI Framework
+GUI\ArcUI_GUI_Theme.lua
+GUI\ArcUI_GUI_Core.lua
+GUI\ArcUI_GUI_Widgets.lua
+GUI\ArcUI_GUI_Sidebar.lua
+GUI\ArcUI_GUI_MainFrame.lua
+
 # Cooldown Reminder
 Cooldown_Reminder\ArcUI_CooldownReminder.lua
 Cooldown_Reminder\ArcUI_CooldownReminder_Options.lua

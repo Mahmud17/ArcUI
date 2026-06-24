@@ -11676,7 +11676,7 @@ function ns.AppearanceOptions.GetOptionsTable()
         width = 0.9,
         hidden = function()
           local cfg = GetSelectedConfig()
-          return GetSelectedConfig() == nil or not SupportsCDMGroupAnchor() or collapsedSections.groupAnchor or not (cfg and cfg.display.anchorToGroup and cfg.display.matchGroupWidth)
+          return IsResourceBar() or GetSelectedConfig() == nil or not SupportsCDMGroupAnchor() or collapsedSections.groupAnchor or not (cfg and cfg.display.anchorToGroup and cfg.display.matchGroupWidth)
         end
       },
       matchIconEdges = {
@@ -11698,7 +11698,7 @@ function ns.AppearanceOptions.GetOptionsTable()
         width = 0.9,
         hidden = function()
           local cfg = GetSelectedConfig()
-          return not IsResourceBar() or GetSelectedConfig() == nil or not SupportsCDMGroupAnchor() or collapsedSections.groupAnchor or not (cfg and cfg.display.anchorToGroup and cfg.display.matchGroupWidth and cfg.display.matchSlotsOnly)
+          return not IsResourceBar() or GetSelectedConfig() == nil or not SupportsCDMGroupAnchor() or collapsedSections.groupAnchor or not (cfg and cfg.display.anchorToGroup and cfg.display.matchGroupWidth)
         end
       },
       matchWidthAdjust = {

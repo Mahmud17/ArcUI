@@ -646,7 +646,7 @@ ns.DB_DEFAULTS = {
       anchorOffsetX = 0,
       anchorOffsetY = -2,
       matchGroupWidth = false,
-      matchSlotsOnly = false,
+      matchSlotsOnly = true,
       matchWidthAdjust = 0,
       -- Reverse fill direction: channels fill instead of drain; casts drain instead of fill
       reverseFill = false,
