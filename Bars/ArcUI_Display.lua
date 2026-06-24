@@ -1706,16 +1706,9 @@ local function GetBarFrames(barNumber)
   return barFrames[barNumber].barFrame, barFrames[barNumber].textFrame, barFrames[barNumber].durationFrame, barFrames[barNumber].iconFrame, barFrames[barNumber].nameFrame, barFrames[barNumber].barIconFrame
 end
 
--- ===================================================================
--- CUSTOM TRACKING SMOOTH UPDATE SYSTEM
--- Smooth animation support:
--- full control over the duration values (not secret values from CDM)
--- ===================================================================
-
 -- ═══════════════════════════════════════════════════════════════════════════
 -- DEACTIVATION: Zero-CPU bars hidden by spec/talent conditions
--- When deactivated, the smooth OnUpdate loop skips the bar entirely
--- and all per-frame OnUpdate scripts are cleared.
+-- When deactivated, all per-frame OnUpdate scripts are cleared and frames hidden.
 -- ═══════════════════════════════════════════════════════════════════════════
 local function DeactivateBar(barNumber)
   local frames = barFrames[barNumber]
@@ -1742,24 +1735,6 @@ end
 local function ReactivateBar(barNumber)
   -- No-op: deactivation is handled by frame visibility
 end
-
-
-local smoothUpdateFrame = CreateFrame("Frame")
-local SMOOTH_UPDATE_INTERVAL = 0.03  -- ~30fps for smooth animation
-local smoothUpdateElapsed = 0
-
-smoothUpdateFrame:SetScript("OnUpdate", function(self, elapsed)
-  smoothUpdateElapsed = smoothUpdateElapsed + elapsed
-  if smoothUpdateElapsed < SMOOTH_UPDATE_INTERVAL then return end
-  smoothUpdateElapsed = 0
-  
-  -- Skip updates when preview mode is active (prevents flickering)
-  if previewMode and IsOptionsOpen() then return end
-  
-  local currentTime = GetTime()
-  
-
-end)
 
 -- ===================================================================
 -- SHARED: UPDATE TICK MARKS FOR A BAR
@@ -2356,6 +2331,24 @@ function ns.Display.UpdateBar(barNumber, stacks, maxStacks, active, durationFont
         textFrame.text:SetText(stacks)
         if not textFrame:IsShown() then textFrame:Show() end
       end
+      -- Duration text refresh on the fast-path. The C-side DurationTextBinding
+      -- only re-reads its duration when Bind is re-called; the full path below
+      -- does that, but this fast-path returns before reaching it. So a buff
+      -- REFRESH (duration changed while active stayed true — e.g. Marrowrend
+      -- re-applying Bone Shield) would leave the countdown stuck on the old
+      -- value. Re-bind here so refreshes are caught on the fast-path too. Only
+      -- the GetAuraInfo binding source needs this: the pre-12.0.7 OnUpdate
+      -- fallback re-reads every tick and totems poll on their own.
+      if barConfig.display.showDuration and durationFrame and durationFontString
+         and durationFontString.GetAuraInfo and ns.DurationText and ns.DurationText.IsSupported() then
+        local auraID, unit = durationFontString:GetAuraInfo()
+        if auraID and unit then
+          local durObj = C_UnitAuras.GetAuraDuration(unit, auraID)
+          if durObj then
+            ns.DurationText.Bind(durationFrame.text, durObj, barConfig.display.durationDecimals or 1, unit, auraID, barConfig.display)
+          end
+        end
+      end
       -- Restore frames hidden externally (e.g. HideBar from Core trackingOK=false)
       -- If barFrame was hidden, force full path so duration/name/etc get properly re-setup
       if barConfig.display.enabled and not barFrame:IsShown() then
@@ -2941,7 +2934,7 @@ function ns.Display.UpdateBar(barNumber, stacks, maxStacks, active, durationFont
           durationFrame.isActive = false
           durationFrame.sourceBar = nil
           if durObj then
-            ns.DurationText.Bind(durationFrame.text, durObj, decimals)
+            ns.DurationText.Bind(durationFrame.text, durObj, decimals, unit, auraID, barConfig.display)
           else
             ns.DurationText.Unbind(durationFrame.text)
           end
@@ -4292,7 +4285,7 @@ function ns.Display.UpdateDurationBar(barNumber, stacks, maxStacks, active, sour
           durationFrame.isActive = false
           durationFrame.sourceBar = nil
           if durObj then
-            ns.DurationText.Bind(durationFrame.text, durObj, decimals)
+            ns.DurationText.Bind(durationFrame.text, durObj, decimals, unit, auraID, barConfig.display)
           else
             ns.DurationText.Unbind(durationFrame.text)
           end
@@ -4801,13 +4794,25 @@ function ns.Display.ApplyAppearance(barNumber)
     local offsetY = cfg.textAnchorOffsetY or 0
     local padding = 5  -- Small padding from edge for visual clarity
     
+    -- Justify the inner text by the chosen side so the FIRST character (not the
+    -- text's centre) pins to the anchor edge. Single-point anchored, so the text
+    -- still overflows freely (no width clamp / truncation).
+    local justify = "CENTER"
+    if textAnchor == "LEFT" or textAnchor == "CENTERLEFT" then justify = "LEFT"
+    elseif textAnchor == "RIGHT" or textAnchor == "CENTERRIGHT" then justify = "RIGHT" end
+    textFrame.text:ClearAllPoints()
+    textFrame.text:SetJustifyH(justify)
+    if justify == "LEFT" then textFrame.text:SetPoint("LEFT", textFrame, "LEFT", 0, 0)
+    elseif justify == "RIGHT" then textFrame.text:SetPoint("RIGHT", textFrame, "RIGHT", 0, 0)
+    else textFrame.text:SetPoint("CENTER", textFrame, "CENTER", 0, 0) end
+
     -- Inner anchors (text inside bar)
     if textAnchor == "CENTER" then
       textFrame:SetPoint("CENTER", barFrame, "CENTER", offsetX, offsetY)
     elseif textAnchor == "RIGHT" or textAnchor == "CENTERRIGHT" then
-      textFrame:SetPoint("CENTER", barFrame, "RIGHT", -padding + offsetX, offsetY)
+      textFrame:SetPoint("RIGHT", barFrame, "RIGHT", -padding + offsetX, offsetY)
     elseif textAnchor == "LEFT" or textAnchor == "CENTERLEFT" then
-      textFrame:SetPoint("CENTER", barFrame, "LEFT", padding + offsetX, offsetY)
+      textFrame:SetPoint("LEFT", barFrame, "LEFT", padding + offsetX, offsetY)
     elseif textAnchor == "TOP" then
       textFrame:SetPoint("CENTER", barFrame, "TOP", offsetX, -padding + offsetY)
     elseif textAnchor == "BOTTOM" then
@@ -4891,13 +4896,24 @@ function ns.Display.ApplyAppearance(barNumber)
       local offsetY = cfg.durationAnchorOffsetY or 0
       local padding = 5
       
+      -- Justify the inner text by the chosen side so the FIRST character (not the
+      -- text's centre) pins to the anchor edge. Single-point anchored = no truncation.
+      local justify = "CENTER"
+      if durationAnchor == "LEFT" or durationAnchor == "CENTERLEFT" or durationAnchor == "LEFT_INNER" then justify = "LEFT"
+      elseif durationAnchor == "RIGHT" or durationAnchor == "CENTERRIGHT" or durationAnchor == "RIGHT_INNER" then justify = "RIGHT" end
+      durationFrame.text:ClearAllPoints()
+      durationFrame.text:SetJustifyH(justify)
+      if justify == "LEFT" then durationFrame.text:SetPoint("LEFT", durationFrame, "LEFT", 0, 0)
+      elseif justify == "RIGHT" then durationFrame.text:SetPoint("RIGHT", durationFrame, "RIGHT", 0, 0)
+      else durationFrame.text:SetPoint("CENTER", durationFrame, "CENTER", 0, 0) end
+
       -- New format (matching textAnchor) + backward compatibility for old format
       if durationAnchor == "CENTER" then
         durationFrame:SetPoint("CENTER", barFrame, "CENTER", offsetX, offsetY)
       elseif durationAnchor == "RIGHT" or durationAnchor == "CENTERRIGHT" or durationAnchor == "RIGHT_INNER" then
-        durationFrame:SetPoint("CENTER", barFrame, "RIGHT", -padding + offsetX, offsetY)
+        durationFrame:SetPoint("RIGHT", barFrame, "RIGHT", -padding + offsetX, offsetY)
       elseif durationAnchor == "LEFT" or durationAnchor == "CENTERLEFT" or durationAnchor == "LEFT_INNER" then
-        durationFrame:SetPoint("CENTER", barFrame, "LEFT", padding + offsetX, offsetY)
+        durationFrame:SetPoint("LEFT", barFrame, "LEFT", padding + offsetX, offsetY)
       elseif durationAnchor == "TOP" or durationAnchor == "TOP_INNER" then
         durationFrame:SetPoint("CENTER", barFrame, "TOP", offsetX, -padding + offsetY)
       elseif durationAnchor == "BOTTOM" or durationAnchor == "BOTTOM_INNER" then
@@ -5079,17 +5095,28 @@ function ns.Display.ApplyAppearance(barNumber)
     local nameAnchor = cfg.nameAnchor or "CENTER"
     if nameAnchor ~= "FREE" then
       nameFrame:ClearAllPoints()
-      local offsetX = cfg.nameAnchorOffsetX or 0
-      local offsetY = cfg.nameAnchorOffsetY or 0
+      local offsetX = cfg.nameOffsetX or 0
+      local offsetY = cfg.nameOffsetY or 0
       local padding = 5
       
+      -- Justify the inner text by the chosen side so the FIRST character (not the
+      -- text's centre) pins to the anchor edge. Single-point anchored = no truncation.
+      local justify = "CENTER"
+      if nameAnchor == "LEFT" or nameAnchor == "CENTERLEFT" then justify = "LEFT"
+      elseif nameAnchor == "RIGHT" or nameAnchor == "CENTERRIGHT" then justify = "RIGHT" end
+      nameFrame.text:ClearAllPoints()
+      nameFrame.text:SetJustifyH(justify)
+      if justify == "LEFT" then nameFrame.text:SetPoint("LEFT", nameFrame, "LEFT", 0, 0)
+      elseif justify == "RIGHT" then nameFrame.text:SetPoint("RIGHT", nameFrame, "RIGHT", 0, 0)
+      else nameFrame.text:SetPoint("CENTER", nameFrame, "CENTER", 0, 0) end
+
       -- New format (matching textAnchor) + backward compatibility for old format
       if nameAnchor == "CENTER" then
         nameFrame:SetPoint("CENTER", barFrame, "CENTER", offsetX, offsetY)
       elseif nameAnchor == "RIGHT" or nameAnchor == "CENTERRIGHT" then
-        nameFrame:SetPoint("CENTER", barFrame, "RIGHT", -padding + offsetX, offsetY)
+        nameFrame:SetPoint("RIGHT", barFrame, "RIGHT", -padding + offsetX, offsetY)
       elseif nameAnchor == "LEFT" or nameAnchor == "CENTERLEFT" then
-        nameFrame:SetPoint("CENTER", barFrame, "LEFT", padding + offsetX, offsetY)
+        nameFrame:SetPoint("LEFT", barFrame, "LEFT", padding + offsetX, offsetY)
       elseif nameAnchor == "TOP" then
         nameFrame:SetPoint("CENTER", barFrame, "TOP", offsetX, -padding + offsetY)
       elseif nameAnchor == "BOTTOM" then
@@ -5362,7 +5389,7 @@ function ns.Display.OpenOptionsForBar(barType, barNumber)
   AceConfigRegistry:NotifyChange("ArcUI")
   
   -- Select the appearance tab (now under bars)
-  AceConfigDialog:SelectGroup("ArcUI", "bars", "appearance")
+  AceConfigDialog:SelectGroup("ArcUI", "auras", "appearance")
 end
 
 -- ===================================================================

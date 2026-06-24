@@ -30,10 +30,24 @@ end
 -- DB ACCESSOR
 -- ===================================================================
 local function GetCastbarDB()
-  local db = ns.API and ns.API.GetDB and ns.API.GetDB()
+  -- Resolve via the shared-aware store so shared-castbar mode (account-wide) is honored.
+  local store = ns.API and ns.API.GetCastbarStore and ns.API.GetCastbarStore()
   -- Phase 1: operate on instance 1 (today's single bar). Multi-instance routing lands in Phase 2.
-  return db and db.castbars and db.castbars[1]
+  return store and store.castbars and store.castbars[1]
 end
+
+-- Bar LOCATION resolver. In shared mode the on-screen position stays PER-CHARACTER unless the user
+-- opts to share location too (castbarShareLocation). Only barPosition routes through this; the look
+-- (and the icon's offset relative to the bar) stays on the normal shared store.
+local function GetCastbarPositionCfg()
+  local g = ns.db and ns.db.global
+  if g and g.castbarShared and not g.castbarShareLocation then
+    local c = ns.db.char
+    return c and c.castbars and c.castbars[1]
+  end
+  return GetCastbarDB()
+end
+ns.Castbar.GetPositionCfg = GetCastbarPositionCfg  -- exposed so the options X/Y sliders edit the same store
 
 -- ===================================================================
 -- CAST STATE
@@ -259,7 +273,7 @@ local function CreateCastbarFrames()
   -- the handle. Mouse is only enabled while the options panel is open (see ShowPreview /
   -- HidePreview), so the bar never captures clicks during normal play.
   local function SaveCastbarPosition()
-    local cfg = GetCastbarDB()
+    local cfg = GetCastbarPositionCfg()
     if cfg then
       local point, _, relPoint, x, y = frame:GetPoint()
       if point then
@@ -577,17 +591,26 @@ end
 -- BLIZZARD CASTBAR VISIBILITY
 -- ===================================================================
 local blizzCastBarHooked = false
+local blizzCastBarHideActive = false  -- live gate: the Show->Hide hook only suppresses while this is true
 local function ApplyBlizzCastBarVisibility()
   local cfg = GetCastbarDB()
   local frame = PlayerCastingBarFrame
   if not frame then return end
-  if cfg and cfg.hideCastBar then
-    frame:Hide()
+  local shouldHide = (cfg and cfg.hideCastBar) and true or false
+  local wasHiding  = blizzCastBarHideActive
+  blizzCastBarHideActive = shouldHide
+  if shouldHide then
+    -- Install the suppress hook once, but gate it on the live flag so hiding is REVERSIBLE
+    -- (toggling hideCastBar -- or shared mode -- back off restores the bar without a /reload).
     if not blizzCastBarHooked then
       blizzCastBarHooked = true
-      hooksecurefunc(frame, "Show", function(self) self:Hide() end)
+      hooksecurefunc(frame, "Show", function(self)
+        if blizzCastBarHideActive then self:Hide() end
+      end)
     end
-  elseif not blizzCastBarHooked then
+    frame:Hide()
+  elseif wasHiding then
+    -- Only on the hide->show transition: restore the Blizzard castbar (the gated hook is now inert).
     frame:Show()
   end
 end
@@ -641,7 +664,8 @@ function ns.Castbar.ApplyAppearance()
     end
   end
   if not _anchorDone then
-    local pos = cfg.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=-100}
+    local pcfg = GetCastbarPositionCfg()
+    local pos = (pcfg and pcfg.barPosition) or {point="CENTER", relPoint="CENTER", x=0, y=-100}
     mainFrame:ClearAllPoints()
     mainFrame:SetPoint(pos.point or "CENTER", UIParent, pos.relPoint or "CENTER", pos.x or 0, pos.y or -100)
   end
@@ -1517,7 +1541,7 @@ ns.Castbar.MAX_CASTBARS = MAX_CASTBARS
 
 -- Sorted list of enabled instance ids.
 function ns.Castbar.GetActiveInstances()
-  local db = ns.API and ns.API.GetDB and ns.API.GetDB()
+  local db = ns.API and ns.API.GetCastbarStore and ns.API.GetCastbarStore()
   local list = {}
   if db and db.castbars then
     for i = 1, MAX_CASTBARS do
@@ -1530,7 +1554,7 @@ end
 
 -- Enable the first free instance slot with the given cast-type filter; returns its id (or nil).
 function ns.Castbar.CreateInstance(castType)
-  local db = ns.API and ns.API.GetDB and ns.API.GetDB()
+  local db = ns.API and ns.API.GetCastbarStore and ns.API.GetCastbarStore()
   if not (db and db.castbars) then return nil end
   for i = 1, MAX_CASTBARS do
     local cb = db.castbars[i]
@@ -1547,7 +1571,7 @@ end
 -- Disable an instance (instance 1 is the permanent default and is never deleted).
 function ns.Castbar.DeleteInstance(id)
   if not id or id == 1 then return end
-  local db = ns.API and ns.API.GetDB and ns.API.GetDB()
+  local db = ns.API and ns.API.GetCastbarStore and ns.API.GetCastbarStore()
   if db and db.castbars and db.castbars[id] then
     db.castbars[id].enabled = false
     ns.Castbar.ApplyAppearance()
@@ -1559,8 +1583,26 @@ function ns.Castbar.OpenOptions()
   if ns.API and ns.API.OpenOptions then ns.API.OpenOptions() end
   local ACD = LibStub and LibStub("AceConfigDialog-3.0", true)
   if ACD then
-    -- Defer one frame so the panel is built before we navigate to Bars → Castbar.
-    C_Timer.After(0, function() ACD:SelectGroup("ArcUI", "bars", "castbar") end)
+    -- Defer one frame so the panel is built before we navigate to the Castbar tab.
+    C_Timer.After(0, function() ACD:SelectGroup("ArcUI", "castbar") end)
+  end
+end
+
+-- ===================================================================
+-- SHARED CASTBAR PROMOTE
+-- Copy THIS character's castbar config into the account-wide shared store so shared mode
+-- starts from the look you're already using (not defaults). Deep copy via CopyTable so the
+-- nested tables (profiles, spellOverrides, colorThresholds, empowerSegmentColors, positions)
+-- never alias the per-character ones. Reversible: the per-character store is left untouched.
+-- ===================================================================
+function ns.Castbar.PromoteToShared()
+  local src = ns.db and ns.db.char and ns.db.char.castbars
+  local dst = ns.db and ns.db.global and ns.db.global.castbars
+  if not (src and dst) then return end
+  for id in pairs(src) do
+    if type(id) == "number" then
+      dst[id] = CopyTable(src[id])
+    end
   end
 end
 

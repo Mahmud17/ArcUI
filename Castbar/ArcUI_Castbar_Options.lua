@@ -10,8 +10,6 @@ ns.CastbarOptions = ns.CastbarOptions or {}
 local AceConfigRegistry = LibStub and LibStub("AceConfigRegistry-3.0", true)
 local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
 
-local lastCastbarExportString = ""
-local lastCastbarImportString = ""
 
 -- Collapsible-section state (true = collapsed). Same mechanism the aura panel uses.
 local collapsedSections = {
@@ -37,9 +35,16 @@ local collapsedSections = {
 }
 
 local function GetCastbarDB()
-  local db = ns.API and ns.API.GetDB and ns.API.GetDB()
+  -- Resolve via the shared-aware store so shared-castbar mode (account-wide) is honored.
+  local db = ns.API and ns.API.GetCastbarStore and ns.API.GetCastbarStore()
   -- Phase 1: edit instance 1. Phase 2 will route this through the selected-instance id.
   return db and db.castbars and db.castbars[ns.CastbarOptions._selectedID or 1]
+end
+
+-- Bar POSITION config: routes through the runtime's location resolver so the X/Y sliders edit the
+-- same store the bar uses (per-character in shared mode unless location sharing is on).
+local function PosCfg()
+  return (ns.Castbar and ns.Castbar.GetPositionCfg and ns.Castbar.GetPositionCfg()) or GetCastbarDB()
 end
 
 local _notifyToken = 0
@@ -188,7 +193,7 @@ function ns.CastbarOptions.GetOptionsTable()
       hideCastBar = {
         type  = "toggle",
         name  = "Hide Blizzard Castbar",
-        desc  = "Hide the default Blizzard castbar (PlayerCastingBarFrame).\n\n|cffff9900Requires /reload to restore if disabled.|r",
+        desc  = "Hide the default Blizzard castbar (PlayerCastingBarFrame).",
         order = 0.56,
         width = 1.3,
         get   = function() local c = GetCastbarDB(); return c and c.hideCastBar end,
@@ -203,91 +208,44 @@ function ns.CastbarOptions.GetOptionsTable()
         end,
       },
 
-      -- ── Import / Export ──────────────────────────────────────────
-      ieHeader = {
-        type  = "header",
-        name  = "Import / Export",
-        order = 0.57,
-      },
-      ieDesc = {
-        type     = "description",
-        name     = "Copy castbar settings to another character — export here, paste on the alt.",
-        order    = 0.575,
-        fontSize = "small",
-      },
-      exportBtn = {
-        type  = "execute",
-        name  = "Export Settings",
-        desc  = "Generates a string you can paste on another character to copy these castbar settings.",
-        order = 0.58,
-        width = 1.2,
-        func  = function()
-          if not (ns.BarsImportExport and ns.BarsImportExport.ExportCastbarOnly) then
-            print("|cffFF0000[ArcUI]|r Import/Export module not ready.")
-            return
+      shareCastbar = {
+        type    = "toggle",
+        name    = "Share Castbar Across Characters",
+        desc    = "Use ONE castbar for every character on your account. When you turn this on, THIS character's current castbar appearance becomes the shared one. Your other characters' own castbars are kept and restored if you turn this off.\n\n|cffff9900Account-wide. Your aura bars are not affected.|r",
+        order   = 0.57,
+        width   = 2.0,
+        confirm = function(_, v)
+          if v and not (ns.db and ns.db.global and ns.db.global.castbarSharedInit) then
+            return "Make THIS character's current castbar the shared one for all your characters?\n\nYour other characters' castbars are kept and restored if you turn this back off."
           end
-          local str, err = ns.BarsImportExport.ExportCastbarOnly()
-          if err then
-            print("|cffFF0000[ArcUI]|r Export failed: " .. err)
-            lastCastbarExportString = ""
-          else
-            lastCastbarExportString = str
-            print("|cff00FF00[ArcUI]|r Castbar exported — copy the string from the box below.")
+          return false
+        end,
+        get     = function() return ns.db and ns.db.global and ns.db.global.castbarShared end,
+        set     = function(_, v)
+          local g = ns.db and ns.db.global
+          if not g then return end
+          if v and not g.castbarSharedInit then
+            if ns.Castbar and ns.Castbar.PromoteToShared then ns.Castbar.PromoteToShared() end
+            g.castbarSharedInit = true
           end
-          if AceConfigRegistry then AceConfigRegistry:NotifyChange("ArcUI") end
+          g.castbarShared = v
+          Refresh()
         end,
       },
-      exportString = {
-        type      = "input",
-        name      = "Export String (copy this)",
-        order     = 0.585,
-        multiline = 4,
-        width     = "full",
-        hidden    = function() return lastCastbarExportString == "" end,
-        get       = function() return lastCastbarExportString end,
-        set       = function() end,
-      },
-      importInput = {
-        type      = "input",
-        name      = "Paste Import String",
-        order     = 0.59,
-        multiline = 4,
-        width     = "full",
-        get       = function() return lastCastbarImportString end,
-        set       = function(_, val) lastCastbarImportString = val end,
-      },
-      importBtn = {
-        type  = "execute",
-        name  = "Import Settings",
-        desc  = "Apply the pasted castbar settings from another character.",
-        order = 0.595,
-        width = 1.2,
-        func  = function()
-          if not lastCastbarImportString or lastCastbarImportString == "" then
-            print("|cffFF0000[ArcUI]|r Paste an import string first.")
-            return
-          end
-          if not (ns.BarsImportExport and ns.BarsImportExport.ParseImportString) then
-            print("|cffFF0000[ArcUI]|r Import/Export module not ready.")
-            return
-          end
-          local data, err = ns.BarsImportExport.ParseImportString(lastCastbarImportString)
-          if err then
-            print("|cffFF0000[ArcUI]|r Parse error: " .. err)
-            return
-          end
-          if not data.castbars then
-            print("|cffFF0000[ArcUI]|r This string does not contain castbar settings.")
-            return
-          end
-          local ok, result = ns.BarsImportExport.ImportBars(data, "replace")
-          if ok then
-            print("|cff00FF00[ArcUI]|r " .. result)
-            lastCastbarImportString = ""
-          else
-            print("|cffFF0000[ArcUI]|r Import failed: " .. result)
-          end
-          if AceConfigRegistry then AceConfigRegistry:NotifyChange("ArcUI") end
+
+      shareCastbarLocation = {
+        type   = "toggle",
+        name   = "Also Share Castbar Position",
+        desc   = "When the castbar is shared, also use the SAME on-screen position on every character.\n\nOff (default): each character places the shared castbar wherever they like; only the look is shared.",
+        order  = 0.575,
+        width  = 2.0,
+        hidden = function() return not (ns.db and ns.db.global and ns.db.global.castbarShared) end,
+        get    = function() return ns.db and ns.db.global and ns.db.global.castbarShareLocation end,
+        set    = function(_, v)
+          local g = ns.db and ns.db.global
+          if not g then return end
+          g.castbarShareLocation = v
+          Refresh()
         end,
       },
 
@@ -1088,9 +1046,9 @@ function ns.CastbarOptions.GetOptionsTable()
         order   = 130.3,
         min     = -2000, max = 2000, step = 1, bigStep = 10,
         hidden  = H("position"),
-        get     = function() local c = GetCastbarDB(); return (c and c.barPosition and c.barPosition.x) or 0 end,
+        get     = function() local c = PosCfg(); return (c and c.barPosition and c.barPosition.x) or 0 end,
         set = function(_, v)
-          local c = GetCastbarDB()
+          local c = PosCfg()
           if c then
             c.barPosition = c.barPosition or {point="CENTER",relPoint="CENTER",x=0,y=0}
             c.barPosition.x = v
@@ -1106,9 +1064,9 @@ function ns.CastbarOptions.GetOptionsTable()
         order   = 130.4,
         min     = -1000, max = 1000, step = 1, bigStep = 10,
         hidden  = H("position"),
-        get     = function() local c = GetCastbarDB(); return (c and c.barPosition and c.barPosition.y) or 0 end,
+        get     = function() local c = PosCfg(); return (c and c.barPosition and c.barPosition.y) or 0 end,
         set = function(_, v)
-          local c = GetCastbarDB()
+          local c = PosCfg()
           if c then
             c.barPosition = c.barPosition or {point="CENTER",relPoint="CENTER",x=0,y=0}
             c.barPosition.y = v

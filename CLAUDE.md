@@ -75,6 +75,13 @@ Secret values are tainted runtime values addons cannot inspect.
 - Player spellcasts (including pets), even in combat — `UNIT_SPELLCAST_SUCCEEDED` on "player" is safe.
 - `UnitHealthMax`/`UnitPowerMax` for player units; `UnitStagger` for player. `UnitPowerMax` returns
   non-secret 0 if the unit doesn't use that power type.
+- `UnitPower` (CURRENT power, incl. secondary resources like combo points/holy power/chi/essence/
+  arcane charges/soul shards) for the player is annotated `SecretWhenUnitPowerRestricted` — it is
+  NON-secret in normal play and only secret under a restricted context. Do NOT assume current power
+  is secret. The secret-safe color path is `UnitPowerPercent(unit, powerType, false, curve)`; for
+  direct numeric comparison, guard with `issecretvalue` to cover the restricted edge. Rule: confirm
+  any secret claim via the `Secret*` annotations in `Blizzard_APIDocumentationGenerated`, never by
+  inferring from a local variable name or an incomplete rule list.
 - `UnitIsUnit` for target/focus/mouseover/softenemy/softinteract/softfriend tokens (compound tokens
   like boss1target remain secret).
 - `maxCharges` (non-secret as of 12.0.1); `isEnabled` and `isActive` from spell/action cooldown APIs.
@@ -86,9 +93,19 @@ Secret values are tainted runtime values addons cannot inspect.
 **Display helpers:** Curve objects for secret-compatible color transitions;
 `C_StringUtil.TruncateWhenZero` suppresses secret zeros in display text.
 
-**Charge bars:** hook `SetCachedChargeValues(count, shown)` on `CooldownViewerCooldownItemMixin` —
-count is non-secret for CDM spells. `SPELL_UPDATE_COOLDOWN` + `isOnGCD` misses casts within the
-charge GCD; catch final-charge spends with `UNIT_SPELLCAST_SUCCEEDED` on "player".
+**Charge bars / charge count:** hook `SetCachedChargeValues(count, shown)` on
+`CooldownViewerCooldownItemMixin`. The `count` is SECRET when cooldowns are restricted
+(instances/M+/PvP): it is sourced from `GetSpellCharges`/`GetSpellCastCount`, both
+`SecretWhenCooldownsRestricted`, and CDM's own `RefreshSpellChargeInfo` only ever `SetText`s it,
+never compares it (when Blizzard refuses to compare a value, it is secret). It is non-secret ONLY in
+the open world, which is the trap: a `count`-comparison passes at a target dummy and breaks in M+. So
+`count` is safe to DISPLAY (SetText/SetValue are secret-safe sinks) but NEVER to compare or feed a
+ColorCurve. There is no clean way to threshold-color charges by exact count (no min-capable formatter:
+`GetSpellDisplayCount` is max-only); for charge VISUALS use state coloring (full/recharging/all-spent)
+off the charge durObj (`Cooldown:IsShown()` on shadow Cooldowns / `chargeDurObj:EvaluateRemainingPercent`),
+as `ns.CustomLabel`/`ns.CooldownState` already do. `maxCharges` is non-secret (12.0.1). For driving
+updates, `SPELL_UPDATE_COOLDOWN` + `isOnGCD` misses casts within the charge GCD; catch final-charge
+spends with `UNIT_SPELLCAST_SUCCEEDED` on "player". See the `cdm-secret-safe-coloring` skill.
 
 **Scheduling that needs real numbers:** only use NON-secret sources — `GetTime()` plus
 locally-tracked cast times, isActive/isEnabled flags.
