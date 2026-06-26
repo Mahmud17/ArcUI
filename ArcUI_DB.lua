@@ -875,6 +875,7 @@ ns.DB_DEFAULTS = {
         [264689] = true,   -- Fatigued (variant)
         [308312] = true,   -- Time Trial (Mythic+ BL mechanic)
       },
+      watchlist = {},
     },
 
     advancedExternals = {

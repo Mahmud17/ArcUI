@@ -638,6 +638,106 @@ function AD.GetOptionsTable()
                         end,
                     },
 
+                    -- ── Tracked Spells ────────────────────────────────────────
+                    watchlistHeader = (function()
+                        local h = CH("debuffWatchlist")
+                        h.name  = "Tracked Spells"
+                        h.order = 47
+                        return h
+                    end)(),
+
+                    watchlistGroup = {
+                        type   = "group",
+                        name   = "Tracked Spells",
+                        inline = true,
+                        order  = 48,
+                        hidden = hide("debuffWatchlist"),
+                        args   = function()
+                            local args = {
+                                watchlistDesc = {
+                                    type     = "description",
+                                    name     = "Spell IDs added here are always shown regardless of the filter restrictions above. Useful for tracking a specific debuff while still using filters for everything else. The blocklist still takes priority — a spell that is both tracked and blocked will be hidden.\n\n|cffaaaaaa\226\129\185 spellId matching is skipped inside instances due to WoW 12.0 secret values.|r",
+                                    order    = 1,
+                                    fontSize = "small",
+                                    width    = "full",
+                                },
+                                watchAddSpellId = {
+                                    type  = "input",
+                                    name  = "Spell ID",
+                                    desc  = "Type a numeric spell ID, then click Add.",
+                                    order = 2,
+                                    width = 1.1,
+                                    get   = function() return AD._debuffWatchPendingID or "" end,
+                                    set   = function(_, v) AD._debuffWatchPendingID = v end,
+                                },
+                                watchAddButton = {
+                                    type  = "execute",
+                                    name  = "Add",
+                                    desc  = "Add the spell ID above to the tracked spells list.",
+                                    order = 3,
+                                    width = 0.55,
+                                    func  = function()
+                                        local id = tonumber(AD._debuffWatchPendingID)
+                                        if not id or id < 1 then return end
+                                        local db = GetDB()
+                                        if db then
+                                            db.watchlist = db.watchlist or {}
+                                            db.watchlist[id] = true
+                                            AD._debuffWatchPendingID = ""
+                                            if AD.RefreshAllAuras then AD.RefreshAllAuras() end
+                                            LibStub("AceConfigRegistry-3.0"):NotifyChange("ArcUI")
+                                        end
+                                    end,
+                                },
+                                watchClearAll = {
+                                    type  = "execute",
+                                    name  = "Clear All",
+                                    desc  = "Remove every spell ID from the tracked list.",
+                                    order = 4,
+                                    width = 0.85,
+                                    func  = function()
+                                        local db = GetDB()
+                                        if db then
+                                            db.watchlist = {}
+                                            if AD.RefreshAllAuras then AD.RefreshAllAuras() end
+                                            LibStub("AceConfigRegistry-3.0"):NotifyChange("ArcUI")
+                                        end
+                                    end,
+                                },
+                                watchListBreak = { type = "description", name = "", order = 9, width = "full" },
+                            }
+                            local db = GetDB()
+                            if db and db.watchlist then
+                                local order = 10
+                                for spellId, active in pairs(db.watchlist) do
+                                    if active then
+                                        local sname = C_Spell.GetSpellName and C_Spell.GetSpellName(spellId)
+                                        local label = sname
+                                            and (sname .. "  [" .. spellId .. "]")
+                                            or  ("Spell " .. spellId)
+                                        args["wl_" .. spellId] = {
+                                            type  = "execute",
+                                            name  = label,
+                                            desc  = "Click to remove this spell from the tracked list.",
+                                            order = order,
+                                            width = 2.0,
+                                            func  = function()
+                                                local db2 = GetDB()
+                                                if db2 and db2.watchlist then
+                                                    db2.watchlist[spellId] = nil
+                                                    if AD.RefreshAllAuras then AD.RefreshAllAuras() end
+                                                    LibStub("AceConfigRegistry-3.0"):NotifyChange("ArcUI")
+                                                end
+                                            end,
+                                        }
+                                        order = order + 1
+                                    end
+                                end
+                            end
+                            return args
+                        end,
+                    },
+
                     -- ── Position ──────────────────────────────────────────────
                     positionHeader = (function()
                         local h = CH("debuffPosition")

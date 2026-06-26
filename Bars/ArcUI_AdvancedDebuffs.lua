@@ -150,19 +150,25 @@ local function BuildFilterStrings(db)
     return out
 end
 
-local function ShouldShowAura(auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled)
+local function ShouldShowAura(auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled, watchlist)
     if not aura then return false end
-    -- Blacklist: spellId is secret in instances; guard with issecretvalue so it
-    -- filters correctly outside instances and safely skips the check inside.
+    -- Skip non-harmful auras (safety; IDs are sourced from the HARMFUL pool already)
+    local base = C_UnitAuras.IsAuraFilteredOutByInstanceID("player", auraInstanceID, "HARMFUL")
+    if not issecretvalue(base) and base then return false end
+    -- Blocklist takes top priority (spellId is secret in instances; guard with issecretvalue)
     if blacklistEnabled and blacklist then
         local sid = aura.spellId
         if sid and not issecretvalue(sid) and blacklist[sid] then return false end
     end
-    local base = C_UnitAuras.IsAuraFilteredOutByInstanceID("player", auraInstanceID, "HARMFUL")
-    if not issecretvalue(base) and base then return false end
+    -- Watchlist: bypass secondary filter restrictions for explicitly tracked spells
+    if watchlist then
+        local sid = aura.spellId
+        if sid and not issecretvalue(sid) and watchlist[sid] then return true end
+    end
+    -- Secondary filters: each enabled filter must pass (aura must NOT be filtered out)
     for _, filter in ipairs(filterStrings) do
         local filtered = C_UnitAuras.IsAuraFilteredOutByInstanceID("player", auraInstanceID, filter)
-        if not issecretvalue(filtered) and not filtered then return false end
+        if not issecretvalue(filtered) and filtered then return false end
     end
     return true
 end
@@ -601,6 +607,7 @@ function AD.RefreshAllAuras()
     local filterStrings    = BuildFilterStrings(db)
     local blacklist        = db.blacklist
     local blacklistEnabled = db.blacklistEnabled ~= false
+    local watchlist        = db.watchlist
     local ids = C_UnitAuras.GetUnitAuraInstanceIDs("player", "HARMFUL")
     if not ids then
         for _, btn in ipairs(buttonPool) do btn:Hide() end
@@ -610,7 +617,7 @@ function AD.RefreshAllAuras()
     local count = 0
     for _, id in ipairs(ids) do
         local aura = C_UnitAuras.GetAuraDataByAuraInstanceID("player", id)
-        if aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled) then
+        if aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled, watchlist) then
             activeAuras[id] = true
             count = count + 1
             auraCache[count] = aura
@@ -652,6 +659,7 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     local filterStrings    = BuildFilterStrings(db)
     local blacklist        = db.blacklist
     local blacklistEnabled = db.blacklistEnabled ~= false
+    local watchlist        = db.watchlist
     local changed          = false
 
     if removedIDs then
@@ -661,7 +669,7 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     end
     if addedAuras then
         for _, aura in ipairs(addedAuras) do
-            if ShouldShowAura(aura.auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled) then
+            if ShouldShowAura(aura.auraInstanceID, aura, filterStrings, blacklist, blacklistEnabled, watchlist) then
                 activeAuras[aura.auraInstanceID] = true; changed = true
             end
         end
@@ -669,7 +677,7 @@ local function ProcessAuraUpdate(addedAuras, updatedIDs, removedIDs)
     if updatedIDs then
         for _, id in ipairs(updatedIDs) do
             local aura      = C_UnitAuras.GetAuraDataByAuraInstanceID("player", id)
-            local should    = aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled)
+            local should    = aura and ShouldShowAura(id, aura, filterStrings, blacklist, blacklistEnabled, watchlist)
             local was       = activeAuras[id]
             if should and not was then
                 activeAuras[id] = true; changed = true
