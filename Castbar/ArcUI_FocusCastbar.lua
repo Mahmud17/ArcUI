@@ -617,9 +617,7 @@ local function OnUpdate()
     end
 
     -- Positioner mirrors elapsed for kick-tick anchor (SetValue is a secret-safe sink)
-    if not isChannel then
-        mainFrame.positioner:SetValue(duration:GetElapsedDuration())
-    end
+    mainFrame.positioner:SetValue(duration:GetElapsedDuration())
 
     UpdateKickAndColor(cfg)
 end
@@ -766,16 +764,14 @@ local function ShowCast(channel)
     end
     UpdateFocusTargetText()
 
-    local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
-    local fillTex = mainFrame.fillBar:GetStatusBarTexture()
-    if fillTex then fillTex:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1) end
-
     if cfg.hideNotInterruptible then
         mainFrame:SetAlphaFromBoolean(state_notInterruptible, 0, 1)
     end
 
-    -- Drive bar animation automatically via the duration object
+    -- Drive bar animation automatically via the duration object.
+    -- SetTimerDuration resets the fill texture's vertex color, so UpdateBarColor MUST come after.
     mainFrame.fillBar:SetTimerDuration(duration, Enum.StatusBarInterpolation.Immediate, direction)
+    UpdateBarColor(cfg, nil)
 
     -- Positioner mirrors cast elapsed time for kick-tick anchoring
     mainFrame.positioner:SetMinMaxValues(0, duration:GetTotalDuration())
