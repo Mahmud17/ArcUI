@@ -630,6 +630,20 @@ local PREVIEW_DURATION = 3.0
 
 local function PreviewOnUpdate()
     if not mainFrame then return end
+    -- Self-stop: if options panel closed (or callback chain failed), kill preview immediately.
+    if not ns._arcUIOptionsOpen then
+        mainFrame:SetScript("OnUpdate", nil)
+        if mainFrame._textFrame then mainFrame._textFrame:Hide() end
+        if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
+        if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
+        if ns.Glows then
+            ns.Glows.Stop(mainFrame, GLOW_KEY)
+            ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+        end
+        mainFrame:EnableMouse(false)
+        mainFrame:Hide()
+        return
+    end
     local elapsed = GetTime() - castStart
     if elapsed >= PREVIEW_DURATION then
         castStart = GetTime()
