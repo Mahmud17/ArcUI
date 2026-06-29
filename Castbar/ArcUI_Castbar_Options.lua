@@ -1766,5 +1766,6 @@ function ns.CastbarOptions.GetOptionsTable()
     }
   end
 
+
   return opts
 end

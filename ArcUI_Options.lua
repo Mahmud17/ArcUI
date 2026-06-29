@@ -768,16 +768,34 @@ local function GetOptionsTable()
         return tbl
       end)(),
 
-      castbar = (function()
-        local tbl = ns.CastbarOptions and ns.CastbarOptions.GetOptionsTable() or {
-          type = "group",
-          name = "Castbar",
-          args = { loading = { type = "description", name = "Loading...", order = 1 } }
-        }
-        tbl.name  = "Castbar"
-        tbl.order = 5
-        return tbl
-      end)(),
+      castbar = {
+        type        = "group",
+        name        = "Castbar",
+        order       = 5,
+        childGroups = "tab",
+        args        = {
+          playerCastbar = (function()
+            local tbl = ns.CastbarOptions and ns.CastbarOptions.GetOptionsTable() or {
+              type = "group",
+              name = "Player Castbar",
+              args = { loading = { type = "description", name = "Loading...", order = 1 } }
+            }
+            tbl.name  = "Player Castbar"
+            tbl.order = 1
+            return tbl
+          end)(),
+          focusCastbar = (function()
+            local tbl = ns.FocusCastbarOptions and ns.FocusCastbarOptions.GetOptionsTable() or {
+              type = "group",
+              name = "Focus Castbar",
+              args = { loading = { type = "description", name = "Loading...", order = 1 } }
+            }
+            tbl.name  = "Focus Castbar"
+            tbl.order = 2
+            return tbl
+          end)(),
+        },
+      },
 
       setMyKick = (function()
         local tbl = ns.GetSetMyKickOptionsTable and ns.GetSetMyKickOptionsTable() or {
@@ -1349,6 +1367,9 @@ initFrame:SetScript("OnEvent", function(self, event)
       end
       if ns.Castbar and ns.Castbar.Init then
         ns.Castbar.Init()
+      end
+      if ns.FocusCastbar and ns.FocusCastbar.Init then
+        ns.FocusCastbar.Init()
       end
       if ns.AdvancedDebuffs and ns.AdvancedDebuffs.Init then
         ns.AdvancedDebuffs.Init()
