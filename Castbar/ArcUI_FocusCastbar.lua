@@ -1,6 +1,8 @@
 -- ===================================================================
 -- ArcUI_FocusCastbar.lua
 -- Castbar tracking what the focus target is casting.
+-- Uses the WoW 12.0 duration-object model: the StatusBar knows its own
+-- end time and fills itself, so OnUpdate only reads state.
 -- Zero idle CPU: all timers/OnUpdate only run during an active cast
 -- or preview. Events unregistered when disabled.
 -- ===================================================================
@@ -12,6 +14,21 @@ local FC = ns.FocusCastbar
 local LSM          = LibStub and LibStub("LibSharedMedia-3.0", true)
 local GLOW_KEY     = "_arcFCastGlow"
 local IMP_GLOW_KEY = "_arcFCastImpGlow"
+
+local FALLBACK_ICON     = 136243
+local INTERRUPTED       = "Interrupted"
+local INTERRUPTED_BY    = "Interrupted by %s"
+local PREVIEW_DURATION  = 20   -- NorskenUI-style long preview cast
+
+-- Locals for hot paths
+local UnitCastingInfo, UnitChannelInfo = UnitCastingInfo, UnitChannelInfo
+local UnitCastingDuration, UnitChannelDuration = UnitCastingDuration, UnitChannelDuration
+local UnitEmpoweredChannelDuration = UnitEmpoweredChannelDuration
+local UnitExists, UnitName, UnitClass = UnitExists, UnitName, UnitClass
+local GetRaidTargetIndex = GetRaidTargetIndex
+local GetTime = GetTime
+local select, ipairs = select, ipairs
+local random = math.random
 
 -- ===================================================================
 -- Class interrupt spell IDs (checked once per spec change)
@@ -35,30 +52,64 @@ local CLASS_INTERRUPTS = {
 -- ===================================================================
 -- STATE
 -- ===================================================================
-local mainFrame          = nil
-local isEnabled          = false
-local isInitialized      = false
-local castActive         = false
-local isChannel          = false
-local cachedDuration     = nil   -- duration object from UnitCastingDuration / UnitChannelDuration
-local currentSpellID     = nil
-local holdTimer          = nil   -- C_Timer handle
-local holdActive         = false
-local castWasInterrupted = false -- set when INTERRUPTED fires before STOP
-local interruptId        = nil   -- player's interrupt spell ID
-local castStart          = 0    -- GetTime() snapshot used only by PreviewOnUpdate
--- Secret boolean from UnitCastingInfo; passed only to WoW safe-sink APIs, never compared
+local mainFrame     = nil
+local isEnabled     = false
+local isInitialized = false
+
+-- Active-cast state (NorskenUI-style tri-flag)
+local casting       = nil
+local channeling    = nil
+local empowering    = nil
+local currentSpellID = nil
+local cachedDuration = nil   -- the live duration object for the current cast/preview
+
+-- Secret boolean from Unit*Info; only ever passed to WoW safe-sink APIs, never compared
 local state_notInterruptible = nil
+
+local interruptId   = nil    -- player's interrupt spell ID
+
+-- Hold timer (freeze bar briefly after a cast ends)
+local holdTimer     = nil
+local holdActive    = false
+
+-- Preview state
+local isPreview     = false
+local previewTicker    = nil
+local previewHoldTimer = nil
+
 -- Cached Color objects (rebuilt when bar color settings change)
 local castColorObj     = nil
 local unintColorObj    = nil
 local notReadyColorObj = nil
+
+-- Update throttle (NorskenUI uses 0.1s for text; tick/kick run every frame)
+local UPDATE_THROTTLE = 0.1
+local updateElapsed   = 0
+
+-- Forward declarations (called before definition)
+local EndCast
+local StartCast
+local UpdateKickAndColor
 
 -- ===================================================================
 -- DB
 -- ===================================================================
 local function GetDB()
     return ns.db and ns.db.char and ns.db.char.focusCastbar
+end
+
+-- ===================================================================
+-- STATE RESET
+-- ===================================================================
+local function ResetCastState()
+    casting, channeling, empowering = nil, nil, nil
+    currentSpellID = nil
+    state_notInterruptible = nil
+    cachedDuration = nil
+end
+
+local function HasActiveCast()
+    return casting or channeling or empowering
 end
 
 -- ===================================================================
@@ -71,7 +122,8 @@ local function CacheInterruptId()
     if not ids then return end
     for _, id in ipairs(ids) do
         if C_SpellBook and C_SpellBook.IsSpellKnownOrInSpellBook
-           and C_SpellBook.IsSpellKnownOrInSpellBook(id) then
+           and (C_SpellBook.IsSpellKnownOrInSpellBook(id)
+                or C_SpellBook.IsSpellKnownOrInSpellBook(id, Enum.SpellBookSpellBank.Pet)) then
             interruptId = id
             return
         end
@@ -79,7 +131,7 @@ local function CacheInterruptId()
 end
 
 -- ===================================================================
--- COLOR OBJECTS  (rebuilt whenever bar colors change)
+-- COLOR OBJECTS (rebuilt whenever bar colors change)
 -- ===================================================================
 local function RebuildColorObjects(cfg)
     local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
@@ -91,66 +143,92 @@ local function RebuildColorObjects(cfg)
 end
 
 -- ===================================================================
--- BAR COLOR  (all secret boolean paths use WoW 12.0 safe-sink APIs)
+-- BAR COLOR (all secret boolean paths use WoW 12.0 safe-sink APIs)
 -- ===================================================================
 local function UpdateBarColor(cfg, kickCooldown)
     if not mainFrame then return end
     local texture = mainFrame.fillBar:GetStatusBarTexture()
     if not texture then return end
 
-    if kickCooldown and cfg.kickEnabled and interruptId then
-        -- EvaluateColorFromBoolean: picks castColor when kick is ready, notReady when on CD
+    if isPreview then
+        local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
+        texture:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1)
+        return
+    end
+
+    if kickCooldown and cfg.kickEnabled and interruptId and HasActiveCast() then
+        -- EvaluateColorFromBoolean: castColor when kick is ready, notReady when on CD
         local kickColor = C_CurveUtil.EvaluateColorFromBoolean(
             kickCooldown:IsZero(), castColorObj, notReadyColorObj)
         if cfg.uninterruptibleEnabled then
-            -- SetVertexColorFromBoolean: unintColor when cast is not-interruptible
             texture:SetVertexColorFromBoolean(state_notInterruptible, unintColorObj, kickColor)
         else
             texture:SetVertexColorFromBoolean(kickCooldown:IsZero(), castColorObj, notReadyColorObj)
         end
-    elseif cfg.uninterruptibleEnabled then
-        texture:SetVertexColorFromBoolean(state_notInterruptible, unintColorObj, castColorObj)
-    else
-        local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
-        texture:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1)
+        return
     end
+
+    if cfg.uninterruptibleEnabled and HasActiveCast() then
+        texture:SetVertexColorFromBoolean(state_notInterruptible, unintColorObj, castColorObj)
+        return
+    end
+
+    local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
+    texture:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1)
 end
 
 -- ===================================================================
 -- KICK INDICATOR
+-- Positioner mirrors cast progress (via duration object) so the kick
+-- cooldown bar and tick anchor from the live fill position.
 -- ===================================================================
 local function SetupKickBar(cfg)
-    if not (cfg.kickEnabled and interruptId and not isChannel) then
+    if not (cfg.kickEnabled and interruptId) then
         mainFrame.kickTick:SetAlpha(0)
         return
     end
-    if not cachedDuration then
+    local duration = cachedDuration
+    if not duration then
         mainFrame.kickTick:SetAlpha(0)
         return
     end
+
     local h = cfg.height or 18
+    local isChan = channeling or false
+
     mainFrame.kickTick:SetHeight(h)
     local kc = cfg.kickTickColor or {r=1,g=1,b=1,a=1}
     mainFrame.kickTick:SetColorTexture(kc.r, kc.g, kc.b, kc.a or 1)
 
-    local totalDur = cachedDuration:GetTotalDuration()
-    mainFrame.positioner:SetMinMaxValues(0, totalDur)
-    mainFrame.positioner:SetReverseFill(false)
-    mainFrame.positioner:SetValue(0)
+    -- total is a SECRET number for focus casts — safe to pass to SetMinMaxValues,
+    -- never to compare. SetMinMaxValues accepts secrets as a safe sink.
+    local total = duration:GetTotalDuration()
 
-    mainFrame.kickCooldownBar:SetMinMaxValues(0, totalDur)
-    mainFrame.kickCooldownBar:SetReverseFill(false)
+    mainFrame.positioner:SetMinMaxValues(0, total)
+    mainFrame.positioner:SetReverseFill(isChan)
+
     mainFrame.kickCooldownBar:ClearAllPoints()
-    mainFrame.kickCooldownBar:SetPoint("LEFT",   mainFrame.positioner:GetStatusBarTexture(), "RIGHT")
-    mainFrame.kickCooldownBar:SetPoint("RIGHT",  mainFrame.fillBar, "RIGHT")
+    mainFrame.kickCooldownBar:SetMinMaxValues(0, total)
+    mainFrame.kickCooldownBar:SetReverseFill(isChan)
     mainFrame.kickCooldownBar:SetPoint("TOP",    mainFrame.fillBar, "TOP")
     mainFrame.kickCooldownBar:SetPoint("BOTTOM", mainFrame.fillBar, "BOTTOM")
+
     mainFrame.kickTick:ClearAllPoints()
-    mainFrame.kickTick:SetPoint("CENTER", mainFrame.kickCooldownBar:GetStatusBarTexture(), "RIGHT", 0, 0)
+    mainFrame.kickTick:SetSize(2, h)
+
+    if isChan then
+        mainFrame.kickCooldownBar:SetPoint("RIGHT", mainFrame.positioner:GetStatusBarTexture(), "LEFT")
+        mainFrame.kickTick:SetPoint("RIGHT", mainFrame.kickCooldownBar:GetStatusBarTexture(), "LEFT")
+    else
+        mainFrame.kickCooldownBar:SetPoint("LEFT", mainFrame.positioner:GetStatusBarTexture(), "RIGHT")
+        mainFrame.kickTick:SetPoint("LEFT", mainFrame.kickCooldownBar:GetStatusBarTexture(), "RIGHT")
+    end
 end
 
-local function UpdateKickAndColor(cfg)
-    if not (cfg.kickEnabled and interruptId and not isChannel) then
+-- Called every frame from OnUpdate while a cast is active.
+UpdateKickAndColor = function(cfg)
+    if isPreview then return end
+    if not (cfg.kickEnabled and interruptId and HasActiveCast()) then
         mainFrame.kickTick:SetAlpha(0)
         UpdateBarColor(cfg, nil)
         return
@@ -166,31 +244,77 @@ local function UpdateKickAndColor(cfg)
         UpdateBarColor(cfg, nil)
         return
     end
-    mainFrame.kickCooldownBar:SetValue(cooldown:GetRemainingDuration()) -- secret via SetValue safe sink
-    mainFrame.kickTick:SetAlphaFromBoolean(cooldown:IsZero(), 0, 1)    -- 0=hidden when kick ready
+    -- secret via SetValue safe sink
+    mainFrame.kickCooldownBar:SetValue(cooldown:GetRemainingDuration())
+    -- 0 = hidden when kick ready; visible (but hidden on uninterruptible) otherwise
+    mainFrame.kickTick:SetAlphaFromBoolean(cooldown:IsZero(), 0,
+        C_CurveUtil.EvaluateColorValueFromBoolean(state_notInterruptible, 0, 1))
     UpdateBarColor(cfg, cooldown)
+end
+
+-- Advance the positioner (kick-tick anchor) from the live duration object.
+-- GetElapsedDuration is a SECRET number for focus casts; SetValue is a safe sink.
+local function UpdateTickPosition(cfg, duration)
+    if not (cfg.kickEnabled and interruptId) then return end
+    mainFrame.positioner:SetValue(duration:GetElapsedDuration())
 end
 
 -- ===================================================================
 -- IMPORTANT SPELL GLOW
+-- C_Spell.IsSpellImportant returns a SECRET boolean in 12.0 — it must
+-- never be tested in Lua (doing so taints and errors). Instead we start
+-- the glow on a dedicated host frame and toggle only its alpha via the
+-- SetAlphaFromBoolean safe sink, exactly as NorskenUI does.
 -- ===================================================================
-local function UpdateImportantGlow(spellID, cfg, forPreview)
-    if not (cfg.importantGlowEnabled and ns.Glows) then
-        if ns.Glows then ns.Glows.Stop(mainFrame, IMP_GLOW_KEY) end
+local function StartImportantGlowVisual(cfg)
+    if not (ns.Glows and mainFrame.impGlowHost) then return end
+    local gc = cfg.importantGlowColor or {r=1,g=0.2,b=0.2,a=1}
+    ns.Glows.Start(mainFrame.impGlowHost, IMP_GLOW_KEY, cfg.importantGlowType or "pixel", {
+        color      = {gc.r, gc.g, gc.b, gc.a or 1},
+        lines      = cfg.importantGlowLines or 8,
+        frequency  = cfg.importantGlowFrequency or 0.25,
+        thickness  = cfg.importantGlowThickness or 2,
+        frameLevel = 15,
+    })
+end
+
+local function StopImportantGlowVisual()
+    if ns.Glows and mainFrame.impGlowHost then
+        ns.Glows.Stop(mainFrame.impGlowHost, IMP_GLOW_KEY)
+    end
+    if mainFrame.impGlowHost then mainFrame.impGlowHost:SetAlpha(0) end
+end
+
+-- Real-cast path: spellID is a secret number; its importance is a secret
+-- boolean. We pass that secret straight to SetAlphaFromBoolean and never
+-- branch on it.
+local function UpdateImportantGlow(spellID, cfg)
+    if not (cfg.importantGlowEnabled and ns.Glows and mainFrame.impGlowHost) then
+        StopImportantGlowVisual()
         return
     end
-    local show = forPreview or (C_Spell and C_Spell.IsSpellImportant and C_Spell.IsSpellImportant(spellID))
-    if show then
-        local gc = cfg.importantGlowColor or {r=1,g=0.2,b=0.2,a=1}
-        ns.Glows.Start(mainFrame, IMP_GLOW_KEY, cfg.importantGlowType or "pixel", {
-            color      = {gc.r, gc.g, gc.b, gc.a or 1},
-            lines      = cfg.importantGlowLines or 8,
-            frequency  = cfg.importantGlowFrequency or 0.25,
-            thickness  = cfg.importantGlowThickness or 2,
-            frameLevel = 15,
-        })
+    -- Start the glow animation unconditionally, then reveal/hide the host
+    -- based on the secret importance boolean (0 = hidden, 1 = shown).
+    StartImportantGlowVisual(cfg)
+    if C_Spell and C_Spell.IsSpellImportant and spellID then
+        local isImportant = C_Spell.IsSpellImportant(spellID) -- secret boolean, never tested
+        mainFrame.impGlowHost:SetAlphaFromBoolean(isImportant, 1, 0)
     else
-        ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+        mainFrame.impGlowHost:SetAlpha(0)
+    end
+end
+
+-- Preview path: no secret values involved. `show` is a plain boolean.
+local function UpdateImportantGlowPreview(cfg, show)
+    if not (cfg.importantGlowEnabled and ns.Glows and mainFrame.impGlowHost) then
+        StopImportantGlowVisual()
+        return
+    end
+    if show then
+        StartImportantGlowVisual(cfg)
+        mainFrame.impGlowHost:SetAlpha(1)
+    else
+        StopImportantGlowVisual()
     end
 end
 
@@ -283,12 +407,46 @@ local function SavePosition()
     end
 end
 
+-- Safely resolve a global frame name to a usable (non-forbidden) frame object.
+local function SafeGetFrame(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local f = _G[name]
+    if not f then return nil end
+    if f.IsForbidden and f:IsForbidden() then return nil end
+    if not f.GetObjectType then return nil end
+    return f
+end
+FC.SafeGetFrame = SafeGetFrame
+
+-- Whether the bar is currently pinned to another frame (drag disabled while so).
+local function IsFrameAnchored()
+    local cfg = GetDB()
+    return cfg and cfg.anchorToFrame and SafeGetFrame(cfg.anchorFrameName) ~= nil
+end
+FC.IsFrameAnchored = IsFrameAnchored
+
 function FC.ApplyPosition()
     local cfg = GetDB()
     if not cfg or not mainFrame then return end
+    mainFrame:ClearAllPoints()
+
+    -- Frame anchoring: pin the castbar to another UI frame by global name.
+    -- Falls back to the free screen position if the target frame is missing.
+    if cfg.anchorToFrame then
+        local target = SafeGetFrame(cfg.anchorFrameName)
+        if target then
+            mainFrame:SetPoint(
+                cfg.anchorPoint         or "CENTER",
+                target,
+                cfg.anchorRelativePoint or "CENTER",
+                cfg.anchorOffsetX or 0,
+                cfg.anchorOffsetY or 0)
+            return
+        end
+    end
+
     local pos = cfg.barPosition or {point="CENTER", relPoint="CENTER", x=0, y=-120}
     local ap  = cfg.barAnchorPoint or pos.point or "CENTER"
-    mainFrame:ClearAllPoints()
     mainFrame:SetPoint(ap, UIParent, ap, pos.x or 0, pos.y or -120)
 end
 
@@ -316,7 +474,8 @@ local function CreateFocusFrames()
     frame.bg:SetSnapToPixelGrid(false)
     frame.bg:SetTexelSnappingBias(0)
 
-    -- Fill bar
+    -- Fill bar — driven entirely by SetTimerDuration (client interpolation).
+    -- We NEVER call SetValue on it during a cast; the client owns the fill.
     frame.fillBar = CreateFrame("StatusBar", nil, frame)
     frame.fillBar:SetAllPoints()
     frame.fillBar:SetMinMaxValues(0, 1)
@@ -325,7 +484,24 @@ local function CreateFocusFrames()
     frame.fillBar:SetStatusBarColor(1, 0.65, 0, 1)
     frame.fillBar:SetFrameLevel(frame:GetFrameLevel() + 2)
 
-    -- Positioner: invisible; mirrors cast elapsed for kick-tick anchor (non-secret values)
+    -- Spark rides the leading edge of the fill
+    frame.spark = frame.fillBar:CreateTexture(nil, "OVERLAY")
+    frame.spark:SetSize(12, h)
+    frame.spark:SetBlendMode("ADD")
+    frame.spark:SetTexture([[Interface\CastingBar\UI-CastingBar-Spark]])
+    frame.spark:SetPoint("CENTER", frame.fillBar:GetStatusBarTexture(), "RIGHT", 0, 0)
+    frame.spark:Hide()
+
+    -- Important-glow host: the important-spell glow is started on THIS frame, and
+    -- its visibility is toggled purely via SetAlphaFromBoolean(secret) — so the
+    -- secret boolean from C_Spell.IsSpellImportant is never tested in Lua (which
+    -- would taint and error). Overlaps the bar exactly so the glow frames it.
+    frame.impGlowHost = CreateFrame("Frame", nil, frame)
+    frame.impGlowHost:SetAllPoints(frame)
+    frame.impGlowHost:SetFrameLevel(frame:GetFrameLevel() + 6)
+    frame.impGlowHost:SetAlpha(0)
+
+    -- Positioner: invisible; mirrors cast elapsed for kick-tick anchor.
     frame.positioner = CreateFrame("StatusBar", nil, frame.fillBar)
     frame.positioner:SetAllPoints(frame.fillBar)
     frame.positioner:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
@@ -344,6 +520,7 @@ local function CreateFocusFrames()
     frame.kickCooldownBar:SetAllPoints(frame.fillBar)
     frame.kickCooldownBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
     frame.kickCooldownBar:SetStatusBarColor(0, 0, 0, 0)
+    frame.kickCooldownBar:SetClipsChildren(true)
     frame.kickCooldownBar:SetMinMaxValues(0, 1)
     frame.kickCooldownBar:SetValue(0)
     frame.kickCooldownBar:SetFrameLevel(frame.fillBar:GetFrameLevel() + 4)
@@ -374,11 +551,10 @@ local function CreateFocusFrames()
     frame._raidMarker = frame:CreateTexture(nil, "OVERLAY", nil, 7)
     frame._raidMarker:SetSize(32, 32)
     frame._raidMarker:SetPoint("LEFT", frame, "LEFT", 0, 0)
-    -- SetSpriteSheetCell (used by SetRaidTargetIconTexture) requires the sprite sheet file to be set first
     frame._raidMarker:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcons")
     frame._raidMarker:Hide()
 
-    -- Text layer (spell name + timer + caster name)
+    -- Text layer (spell name + timer + caster name + focus target)
     local textF = CreateFrame("Frame", "ArcUIFocusCastbarText", UIParent)
     textF:SetFrameStrata("HIGH")
     textF:SetFrameLevel(200)
@@ -433,7 +609,10 @@ local function CreateFocusFrames()
         moveIcon:SetVertexColor(0.8, 0.8, 0.8, 1)
     end
     dragBtn:RegisterForDrag("LeftButton")
-    dragBtn:SetScript("OnDragStart", function() frame:StartMoving(); DragHighlight() end)
+    dragBtn:SetScript("OnDragStart", function()
+        if IsFrameAnchored() then return end   -- pinned to a frame: offsets control position
+        frame:StartMoving(); DragHighlight()
+    end)
     dragBtn:SetScript("OnDragStop",  function() frame:StopMovingOrSizing(); DragNormal(); SavePosition() end)
     dragBtn:SetScript("OnEnter", DragHighlight)
     dragBtn:SetScript("OnLeave", DragNormal)
@@ -442,7 +621,7 @@ local function CreateFocusFrames()
 
     -- Bar-body drag (click anywhere on bar while options open)
     frame:SetScript("OnMouseDown", function(self, button)
-        if button == "LeftButton" and ns._arcUIOptionsOpen then self:StartMoving() end
+        if button == "LeftButton" and ns._arcUIOptionsOpen and not IsFrameAnchored() then self:StartMoving() end
     end)
     frame:SetScript("OnMouseUp", function(self, button)
         if button == "LeftButton" then self:StopMovingOrSizing(); SavePosition() end
@@ -459,7 +638,7 @@ local function UpdateFocusTargetText()
     local textF = mainFrame._textFrame
     if not textF.focusTargetText then return end
     local cfg = GetDB()
-    if not (cfg and cfg.showFocusTarget and castActive) then
+    if not (cfg and cfg.showFocusTarget and HasActiveCast()) then
         textF.focusTargetText:Hide()
         return
     end
@@ -481,10 +660,11 @@ local function ApplyAppearanceInternal(cfg)
     mainFrame:SetSize(w, h)
     mainFrame:SetFrameStrata(cfg.barFrameStrata or "MEDIUM")
 
+    mainFrame.spark:SetSize(12, h)
+
     local textF = mainFrame._textFrame
     if textF then
         textF:SetSize(w, h)
-        -- Spell name: dynamic width constraint (0 = full auto width)
         textF.nameText:ClearAllPoints()
         local nmw = cfg.spellNameMaxWidth or 0
         if nmw > 0 then
@@ -561,11 +741,13 @@ local function ApplyAppearanceInternal(cfg)
         textF.timerText:SetFont(fontPath, fSize, outline)
         textF.timerText:SetTextColor(tc.r, tc.g, tc.b, tc.a or 1)
         local smallSize = math.max(8, fSize - 2)
+        local cnc = cfg.casterNameColor or {r=1,g=0.82,b=0,a=1}
         textF.casterText:SetFont(fontPath, smallSize, outline)
-        textF.casterText:SetTextColor(1, 0.82, 0, 1)
+        textF.casterText:SetTextColor(cnc.r, cnc.g, cnc.b, cnc.a or 1)
         if textF.focusTargetText then
+            local ftc = cfg.focusTargetColor or {r=0.6,g=0.8,b=1,a=1}
             textF.focusTargetText:SetFont(fontPath, smallSize, outline)
-            textF.focusTargetText:SetTextColor(0.6, 0.8, 1, 1)
+            textF.focusTargetText:SetTextColor(ftc.r, ftc.g, ftc.b, ftc.a or 1)
         end
     end
 
@@ -581,13 +763,13 @@ function FC.ApplyAppearance()
     if not cfg.enabled then
         mainFrame:Hide()
         mainFrame:EnableMouse(false)
+        mainFrame.spark:Hide()
         if mainFrame._textFrame  then mainFrame._textFrame:Hide()  end
         if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
-        if mainFrame._iconFrame  then mainFrame._iconFrame:Hide()  end
         if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
         if ns.Glows then
             ns.Glows.Stop(mainFrame, GLOW_KEY)
-            ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+            StopImportantGlowVisual()
         end
         mainFrame:SetScript("OnUpdate", nil)
         return
@@ -595,69 +777,13 @@ function FC.ApplyAppearance()
     ApplyAppearanceInternal(cfg)
     mainFrame:EnableMouse(ns._arcUIOptionsOpen or false)
     FC.ApplyPosition()
-    if ns._arcUIOptionsOpen and not castActive and not holdActive then
+    if ns._arcUIOptionsOpen and not HasActiveCast() and not holdActive then
         FC.ShowPreview()
     end
 end
 
 -- ===================================================================
--- ONUPDATE — real cast timer (bar driven by SetTimerDuration; we update text + kick)
--- ===================================================================
-local function OnUpdate()
-    local cfg = GetDB()
-    if not cfg or not castActive then return end
-
-    local duration = mainFrame.fillBar:GetTimerDuration()
-    if not duration then return end
-
-    -- Timer text via SetFormattedText (secret-safe sink for duration values)
-    local textF = mainFrame._textFrame
-    if textF and cfg.showTimer then
-        textF.timerText:SetFormattedText("%.1f", duration:GetRemainingDuration())
-    end
-
-    -- Positioner mirrors elapsed for kick-tick anchor (SetValue is a secret-safe sink)
-    mainFrame.positioner:SetValue(duration:GetElapsedDuration())
-
-    UpdateKickAndColor(cfg)
-end
-
--- ===================================================================
--- PREVIEW ANIMATION  (looping, 3-second fake cast)
--- ===================================================================
-local PREVIEW_DURATION = 3.0
-
-local function PreviewOnUpdate()
-    if not mainFrame then return end
-    -- Self-stop: if options panel closed (or callback chain failed), kill preview immediately.
-    if not ns._arcUIOptionsOpen then
-        mainFrame:SetScript("OnUpdate", nil)
-        if mainFrame._textFrame then mainFrame._textFrame:Hide() end
-        if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
-        if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
-        if ns.Glows then
-            ns.Glows.Stop(mainFrame, GLOW_KEY)
-            ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
-        end
-        mainFrame:EnableMouse(false)
-        mainFrame:Hide()
-        return
-    end
-    local elapsed = GetTime() - castStart
-    if elapsed >= PREVIEW_DURATION then
-        castStart = GetTime()
-        elapsed   = 0
-    end
-    mainFrame.fillBar:SetValue(elapsed / PREVIEW_DURATION)
-    local cfg = GetDB()
-    local textF = mainFrame._textFrame
-    if textF and cfg and cfg.showTimer then
-        textF.timerText:SetText(string.format("%.1f", PREVIEW_DURATION - elapsed))
-    end
-end
-
--- ===================================================================
--- HOLD TIMER  (freeze bar for a moment after cast ends)
+-- HOLD TIMER  (freeze bar for a moment after a cast ends)
 -- ===================================================================
 local function CancelHoldTimer()
     if holdTimer then holdTimer:Cancel(); holdTimer = nil end
@@ -665,44 +791,53 @@ local function CancelHoldTimer()
 end
 
 -- Returns true if hold timer was started.
-local function StartHoldTimer(cfg, endReason)
+local function StartHoldTimer(cfg, endReason, interruptedBy)
     CancelHoldTimer()
     if not (cfg.holdEnabled and cfg.holdDuration and cfg.holdDuration > 0) then
         return false
     end
     holdActive = true
 
+    mainFrame.spark:Hide()
+    mainFrame.kickTick:SetAlpha(0)
+
+    -- Freeze the fill full. Hold is a plain 0..1 range with a literal value —
+    -- no secret duration involved, so SetValue(1) is fine here.
+    mainFrame.fillBar:SetMinMaxValues(0, 1)
+    mainFrame.fillBar:SetValue(1)
+    mainFrame.positioner:SetMinMaxValues(0, 1)
+    mainFrame.positioner:SetValue(1)
+
     local texture = mainFrame.fillBar:GetStatusBarTexture()
     local col
+    local textF = mainFrame._textFrame
     if endReason == "interrupted" then
         col = cfg.holdInterruptedColor or {r=0.2,g=0.4,b=1,a=1}
-        mainFrame.fillBar:SetValue(1)
-        if mainFrame._textFrame then
-            mainFrame._textFrame.timerText:SetText("")
-            mainFrame._textFrame.nameText:SetText("Interrupted!")
+        if textF then
+            local label = INTERRUPTED
+            if interruptedBy then label = INTERRUPTED_BY:format(interruptedBy) end
+            textF.nameText:SetText(label)
+            textF.timerText:SetText("")
         end
     elseif endReason == "failed" then
         col = cfg.holdFailColor or {r=1,g=0.5,b=0,a=1}
-        if mainFrame._textFrame then mainFrame._textFrame.timerText:SetText("") end
+        if textF then textF.timerText:SetText("") end
     else
         col = cfg.holdSuccessColor or {r=0.2,g=1,b=0.2,a=1}
-        mainFrame.fillBar:SetValue(1)
-        if mainFrame._textFrame then mainFrame._textFrame.timerText:SetText("") end
+        if textF then textF.timerText:SetText("") end
     end
     if texture then texture:SetVertexColor(col.r, col.g, col.b, col.a or 1) end
-    mainFrame.kickTick:SetAlpha(0)
 
     holdTimer = C_Timer.NewTimer(cfg.holdDuration, function()
         holdTimer  = nil
         holdActive = false
-        if not castActive then
+        if not HasActiveCast() then
             if mainFrame then mainFrame:Hide() end
             if mainFrame and mainFrame._textFrame  then mainFrame._textFrame:Hide()  end
-            if mainFrame and mainFrame._iconFrame  then mainFrame._iconFrame:Hide()  end
             if mainFrame and mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
             if ns.Glows then
                 ns.Glows.Stop(mainFrame, GLOW_KEY)
-                ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+                StopImportantGlowVisual()
             end
             if ns._arcUIOptionsOpen then FC.ShowPreview() end
         end
@@ -711,77 +846,164 @@ local function StartHoldTimer(cfg, endReason)
 end
 
 -- ===================================================================
--- SHOW / HIDE CAST
+-- ONUPDATE — the StatusBar fills ITSELF from SetTimerDuration.
+-- OnUpdate only reads the duration to move the kick tick and to format
+-- the countdown text. It NEVER calls fillBar:SetValue during a cast —
+-- doing so fights the client interpolation and makes the fill stutter.
 -- ===================================================================
-local function ShowCast(channel)
-    if not mainFrame then return end
+local function OnUpdate(_, elapsed)
     local cfg = GetDB()
-    if not cfg or not cfg.enabled then return end
-    CancelHoldTimer()
-    castWasInterrupted = false
+    if not cfg then return end
 
-    local name, text, notInt, spellID, isEmpowered
-    local duration
-    local direction = Enum.StatusBarTimerDirection.ElapsedTime
-
-    if channel then
-        -- UnitChannelInfo: name,text,texture,startMS,endMS,isTradeSkill,notInterruptible,spellID,isEmpowered,...
-        name, text, _, _, _, _, notInt, spellID, isEmpowered = UnitChannelInfo("focus")
-        if name then
-            if isEmpowered and UnitEmpoweredChannelDuration then
-                duration = UnitEmpoweredChannelDuration("focus")
-            else
-                duration  = UnitChannelDuration("focus")
-                direction = Enum.StatusBarTimerDirection.RemainingTime
-            end
+    if isPreview then
+        -- Preview fill is owned by SetTimerDuration too; just move the tick.
+        local duration = mainFrame.fillBar:GetTimerDuration()
+        if duration then
+            mainFrame.positioner:SetValue(duration:GetElapsedDuration())
         end
-    else
-        -- UnitCastingInfo: name,text,texture,startMS,endMS,isTradeSkill,castID,notInterruptible,spellID
-        name, text, _, _, _, _, _, notInt, spellID = UnitCastingInfo("focus")
-        if name then
-            duration = UnitCastingDuration("focus")
+        return
+    end
+
+    if not HasActiveCast() then
+        mainFrame.kickTick:SetAlpha(0)
+        return
+    end
+
+    local duration = mainFrame.fillBar:GetTimerDuration()
+    if duration and cachedDuration then
+        -- Move the kick-tick anchor and refresh kick colour. The fill itself
+        -- is left entirely to the client (SetTimerDuration).
+        UpdateTickPosition(cfg, duration)
+        UpdateKickAndColor(cfg)
+    end
+
+    updateElapsed = updateElapsed + elapsed
+    if updateElapsed < UPDATE_THROTTLE then return end
+    updateElapsed = 0
+
+    if holdActive then return end
+    if not duration then return end
+
+    if cfg.showTimer and mainFrame._textFrame then
+        -- remaining is a SECRET number; SetFormattedText is a safe sink and the
+        -- format string is a literal, so this prints the countdown without a
+        -- taint error. Never compare `remaining`.
+        local remaining = duration:GetRemainingDuration()
+        if remaining then
+            mainFrame._textFrame.timerText:SetFormattedText('%.1f', remaining)
         end
     end
 
-    if not name or not duration then return end
+    UpdateFocusTargetText()
+end
 
-    isChannel              = channel or false
-    cachedDuration         = duration
-    castActive             = true
+local function EnsureOnUpdate()
+    if mainFrame and mainFrame:GetScript("OnUpdate") ~= OnUpdate then
+        mainFrame:SetScript("OnUpdate", OnUpdate)
+    end
+end
+
+-- ===================================================================
+-- START CAST — queries Unit*Info + Unit*Duration and hands the
+-- duration object to the StatusBar (NorskenUI model)
+-- ===================================================================
+StartCast = function()
+    if not mainFrame or not UnitExists("focus") then return end
+    local cfg = GetDB()
+    if not cfg or not cfg.enabled then return end
+
+    local name, text, texture, notInterruptible, spellID, isEmpowered
+    local duration
+    local direction = Enum.StatusBarTimerDirection.ElapsedTime
+
+    -- Try regular cast first
+    name, text, texture, _, _, _, _, notInterruptible, spellID = UnitCastingInfo("focus")
+    if name then
+        casting, channeling, empowering = true, nil, nil
+        duration = UnitCastingDuration("focus")
+    else
+        -- Try channel / empower
+        name, text, texture, _, _, _, notInterruptible, spellID, isEmpowered = UnitChannelInfo("focus")
+        if name then
+            casting = nil
+            if isEmpowered then
+                empowering, channeling = true, nil
+                duration = UnitEmpoweredChannelDuration("focus")
+            else
+                channeling, empowering = true, nil
+                duration = UnitChannelDuration("focus")
+                direction = Enum.StatusBarTimerDirection.RemainingTime
+            end
+        end
+    end
+
+    if not name then
+        -- Nothing to show. Don't wipe a running hold timer.
+        if not holdTimer then
+            ResetCastState()
+            mainFrame:Hide()
+            if mainFrame._textFrame then mainFrame._textFrame:Hide() end
+        end
+        return
+    end
+
+    -- New real cast supersedes any pending hold AND any running preview.
+    -- Without clearing isPreview here the OnUpdate would stay on the preview
+    -- branch and the preview ticker would keep firing "interrupted" flashes
+    -- even after the options panel closes.
+    CancelHoldTimer()
+    isPreview = false
+    if previewTicker    then previewTicker:Cancel();    previewTicker    = nil end
+    if previewHoldTimer then previewHoldTimer:Cancel(); previewHoldTimer = nil end
+    mainFrame:SetFrameStrata(cfg.barFrameStrata or "MEDIUM")
+    if mainFrame._textFrame then mainFrame._textFrame:SetFrameStrata("HIGH") end
+
     currentSpellID         = spellID
-    state_notInterruptible = notInt  -- secret boolean; never compared directly
+    state_notInterruptible = notInterruptible
+    cachedDuration         = duration
     RebuildColorObjects(cfg)
 
     if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
     mainFrame:EnableMouse(false)
     mainFrame:SetAlpha(1)
 
+    -- Hide non-interruptible casts if configured (secret-safe)
+    if cfg.hideNotInterruptible then
+        mainFrame:SetAlphaFromBoolean(notInterruptible, 0, 1)
+    end
+
+    -- Hand the duration to the StatusBar; the client owns the fill from here.
+    -- SetTimerDuration sets its own min/max from the duration total — we do
+    -- NOT force (0,1) first, and we do NOT call SetValue afterwards.
+    mainFrame.fillBar:SetTimerDuration(duration, Enum.StatusBarInterpolation.Immediate, direction)
+
+    -- Positioner mirrors cast progress for tick anchoring
+    local isChan = channeling == true
+    mainFrame.positioner:SetReverseFill(isChan)
+    if duration then
+        mainFrame.positioner:SetMinMaxValues(0, duration:GetTotalDuration())
+    end
+    mainFrame.positioner:SetValue(0)
+
+    -- Text
     local textF = mainFrame._textFrame
     if textF then
         textF.nameText:SetText(cfg.showSpellName   and (text or name) or "")
         textF.casterText:SetText(cfg.showCasterName and UnitName("focus") or "")
+        textF.timerText:SetText("")
         textF:Show()
     end
     UpdateFocusTargetText()
 
-    if cfg.hideNotInterruptible then
-        mainFrame:SetAlphaFromBoolean(state_notInterruptible, 0, 1)
-    end
+    -- Spark
+    mainFrame.spark:Show()
 
-    -- Drive bar animation automatically via the duration object.
-    -- SetTimerDuration resets the fill texture's vertex color, so UpdateBarColor MUST come after.
-    mainFrame.fillBar:SetTimerDuration(duration, Enum.StatusBarInterpolation.Immediate, direction)
     UpdateBarColor(cfg, nil)
-
-    -- Positioner mirrors cast elapsed time for kick-tick anchoring
-    mainFrame.positioner:SetMinMaxValues(0, duration:GetTotalDuration())
-    mainFrame.positioner:SetReverseFill(isChannel)
-    mainFrame.positioner:SetValue(0)
-
     UpdateRaidMarker(false)
     mainFrame.kickTick:SetAlpha(0)
     SetupKickBar(cfg)
 
+    -- Glows
     if cfg.showGlow and ns.Glows then
         local gc = cfg.glowColor or {r=1,g=0.65,b=0,a=1}
         ns.Glows.Start(mainFrame, GLOW_KEY, cfg.glowType or "pixel", {
@@ -794,30 +1016,36 @@ local function ShowCast(channel)
     elseif ns.Glows then
         ns.Glows.Stop(mainFrame, GLOW_KEY)
     end
+    if spellID then UpdateImportantGlow(spellID, cfg) end
 
-    if spellID then UpdateImportantGlow(spellID, cfg, false) end
-
+    EnsureOnUpdate()
     mainFrame:Show()
-    mainFrame._textFrame:Show()
-    mainFrame:SetScript("OnUpdate", OnUpdate)
+    if textF then textF:Show() end
 end
 
-local function EndCast(endReason)
-    if not castActive then return end
-    if not mainFrame or not mainFrame:IsShown() then castActive = false; return end
+-- ===================================================================
+-- END CAST
+-- ===================================================================
+EndCast = function(endReason, interruptedBy)
+    if not HasActiveCast() then return end
+    if not mainFrame or not mainFrame:IsShown() then ResetCastState(); return end
     if holdTimer then return end
-    castActive = false
-    cachedDuration = nil
-    mainFrame:SetScript("OnUpdate", nil)
+
+    mainFrame.spark:Hide()
     mainFrame.kickTick:SetAlpha(0)
-    local cfg = GetDB()
+    UpdateFocusTargetText() -- will hide since HasActiveCast() about to be false
     if ns.Glows then
         ns.Glows.Stop(mainFrame, GLOW_KEY)
-        ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+        StopImportantGlowVisual()
     end
-    if mainFrame._iconFrame  then mainFrame._iconFrame:Hide()  end
     if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
-    if cfg and not StartHoldTimer(cfg, endReason) then
+
+    local cfg = GetDB()
+
+    ResetCastState()
+    mainFrame:SetScript("OnUpdate", nil)
+
+    if not (cfg and StartHoldTimer(cfg, endReason, interruptedBy)) then
         mainFrame:Hide()
         if mainFrame._textFrame then mainFrame._textFrame:Hide() end
         if ns._arcUIOptionsOpen then FC.ShowPreview() end
@@ -825,22 +1053,234 @@ local function EndCast(endReason)
 end
 
 local function HideCast()
-    castActive = false
-    cachedDuration = nil
+    ResetCastState()
     CancelHoldTimer()
     if not mainFrame then return end
     mainFrame:SetScript("OnUpdate", nil)
+    mainFrame.spark:Hide()
     mainFrame.fillBar:SetValue(0)
     mainFrame.kickTick:SetAlpha(0)
     if ns.Glows then
         ns.Glows.Stop(mainFrame, GLOW_KEY)
-        ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
+        StopImportantGlowVisual()
     end
     if mainFrame._textFrame  then mainFrame._textFrame:Hide()  end
-    if mainFrame._iconFrame  then mainFrame._iconFrame:Hide()  end
     if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
     mainFrame:Hide()
     if ns._arcUIOptionsOpen then FC.ShowPreview() end
+end
+
+-- ===================================================================
+-- INTERRUPTIBLE REFRESH
+-- ===================================================================
+local function UpdateInterruptible()
+    if not HasActiveCast() or not mainFrame then return end
+    local newNotInt
+    if channeling or empowering then
+        local _,_,_,_,_,_, ni = UnitChannelInfo("focus")
+        newNotInt = ni
+    else
+        local _,_,_,_,_,_,_, ni = UnitCastingInfo("focus")
+        newNotInt = ni
+    end
+    state_notInterruptible = newNotInt
+    local cfg = GetDB()
+    if not cfg then return end
+    if cfg.hideNotInterruptible then
+        mainFrame:SetAlphaFromBoolean(state_notInterruptible, 0, 1)
+    end
+    UpdateBarColor(cfg, nil)
+end
+
+-- ===================================================================
+-- PREVIEW  (NorskenUI-style: looping fake cast -> interrupt -> recast)
+-- Only shown while options panel is open or native Edit Mode active.
+-- The preview uses a NON-secret duration (C_DurationUtil) so its numeric
+-- getters are safe to read for the timer text as well.
+-- ===================================================================
+local function StartPreviewTimer()
+    local duration = C_DurationUtil.CreateDuration()
+    duration:SetTimeFromStart(GetTime(), PREVIEW_DURATION)
+    mainFrame.fillBar:SetTimerDuration(duration, Enum.StatusBarInterpolation.Immediate,
+        Enum.StatusBarTimerDirection.ElapsedTime)
+    cachedDuration = duration
+    mainFrame.positioner:SetMinMaxValues(0, PREVIEW_DURATION)
+    mainFrame.positioner:SetReverseFill(false)
+    mainFrame.positioner:SetValue(0)
+end
+
+local function PreviewSetCastVisuals(cfg)
+    local textF = mainFrame._textFrame
+    if textF then
+        textF.nameText:SetText(cfg.showSpellName    and "Focus Castbar" or "")
+        textF.casterText:SetText(cfg.showCasterName and "Focus Target"  or "")
+        textF.timerText:SetText("")
+        if textF.focusTargetText then
+            if cfg.showFocusTarget then
+                textF.focusTargetText:SetText("Enemy Name")
+                textF.focusTargetText:Show()
+            else
+                textF.focusTargetText:Hide()
+            end
+        end
+        textF:Show()
+    end
+
+    mainFrame.spark:Show()
+    local bc = cfg.barColor or {r=1,g=0.65,b=0,a=1}
+    local fillTex = mainFrame.fillBar:GetStatusBarTexture()
+    if fillTex then fillTex:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1) end
+
+    -- Raid marker default (moon = 8) for positioning
+    if cfg.showRaidMarker then
+        local defIdx = cfg.raidMarkerDefault or 8
+        if defIdx > 0 then
+            ApplyRaidMarkerSettings()
+            ---@diagnostic disable-next-line: undefined-global
+            SetRaidTargetIconTexture(mainFrame._raidMarker, defIdx)
+            mainFrame._raidMarker:Show()
+        else
+            mainFrame._raidMarker:Hide()
+        end
+    end
+
+    -- Glow outline so the bar is easy to see/position
+    if ns.Glows then
+        local gc = cfg.showGlow and cfg.glowColor or {r=1, g=0.65, b=0, a=1}
+        ns.Glows.Start(mainFrame, GLOW_KEY, cfg.glowType or "pixel", {
+            color      = {gc.r, gc.g, gc.b, gc.a or 1},
+            thickness  = cfg.glowWidth     or 2,
+            lines      = cfg.glowLines     or 8,
+            frequency  = cfg.glowFrequency or 0.25,
+            frameLevel = 15,
+        })
+    end
+    UpdateImportantGlowPreview(cfg, cfg.importantGlowEnabled)
+end
+
+local function PreviewShowInterrupted(cfg)
+    isPreview = true
+    casting = false  -- interrupted display; not an active cast
+    mainFrame.spark:Hide()
+    mainFrame.kickTick:SetAlpha(0)
+    mainFrame.kickCooldownBar:SetValue(0)
+    if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
+
+    mainFrame.fillBar:SetMinMaxValues(0, 1)
+    mainFrame.fillBar:SetValue(1)
+    mainFrame.positioner:SetMinMaxValues(0, 1)
+    mainFrame.positioner:SetValue(1)
+
+    local textF = mainFrame._textFrame
+    if textF then
+        textF.nameText:SetText(INTERRUPTED_BY:format("Focus Target"))
+        textF.timerText:SetText("")
+    end
+
+    local holdColor = cfg.holdInterruptedColor or {r=0.2,g=0.4,b=1,a=1}
+    local texture = mainFrame.fillBar:GetStatusBarTexture()
+    if texture then texture:SetVertexColor(holdColor.r, holdColor.g, holdColor.b, holdColor.a or 1) end
+
+    if previewHoldTimer then previewHoldTimer:Cancel() end
+    local holdDur = (cfg.holdEnabled and cfg.holdDuration and cfg.holdDuration > 0)
+                    and cfg.holdDuration or 1.5
+    previewHoldTimer = C_Timer.NewTimer(holdDur, function()
+        previewHoldTimer = nil
+        -- Self-terminate if the panel closed while we were holding.
+        local nativeEM = EditModeManagerFrame and EditModeManagerFrame:IsShown()
+        if not isPreview or not (ns._arcUIOptionsOpen or nativeEM) then
+            FC.HidePreview()
+            return
+        end
+        casting = true
+        StartPreviewTimer()
+        PreviewSetCastVisuals(GetDB())
+    end)
+end
+
+function FC.ShowPreview()
+    if HasActiveCast() or holdActive then return end
+    local nativeEM = EditModeManagerFrame and EditModeManagerFrame:IsShown()
+    if not ns._arcUIOptionsOpen and not nativeEM then return end
+
+    CreateFocusFrames()
+    if not mainFrame then return end
+    local cfg = GetDB()
+    if not cfg or not cfg.enabled then return end
+    if not isEnabled then FC.Enable() end
+
+    ApplyAppearanceInternal(cfg)
+
+    -- Elevate above AceConfigDialog (FULLSCREEN_DIALOG); restored on hide/real cast
+    mainFrame:SetFrameStrata("TOOLTIP")
+    if mainFrame._textFrame then mainFrame._textFrame:SetFrameStrata("TOOLTIP") end
+
+    FC.ApplyPosition()
+    RebuildColorObjects(cfg)
+
+    mainFrame:EnableMouse(true)
+    mainFrame:SetAlpha(1)
+
+    isPreview = true
+    casting   = true
+
+    StartPreviewTimer()
+    PreviewSetCastVisuals(cfg)
+
+    mainFrame.kickTick:SetAlpha(0)
+    if mainFrame._dragHandle then mainFrame._dragHandle:Show() end
+
+    EnsureOnUpdate()
+    mainFrame:Show()
+
+    -- Loop: after each full preview cast, show interrupt then recast.
+    -- Self-terminates if the options panel / Edit Mode closed underneath us.
+    if previewTicker then previewTicker:Cancel() end
+    previewTicker = C_Timer.NewTicker(PREVIEW_DURATION, function()
+        local nativeEM2 = EditModeManagerFrame and EditModeManagerFrame:IsShown()
+        if not isPreview or not (ns._arcUIOptionsOpen or nativeEM2) then
+            FC.HidePreview()
+            return
+        end
+        if previewHoldTimer then return end
+        PreviewShowInterrupted(GetDB())
+    end)
+end
+
+function FC.HidePreview()
+    -- Authoritative teardown of preview state. Idempotent and does NOT
+    -- depend on ns._arcUIOptionsOpen (which the panel may clear after onClose).
+    local wasPreview = isPreview
+    isPreview = false
+    if previewTicker then previewTicker:Cancel(); previewTicker = nil end
+    if previewHoldTimer then previewHoldTimer:Cancel(); previewHoldTimer = nil end
+    if not mainFrame then return end
+
+    -- Preview sets casting=true, so HasActiveCast() is true DURING a preview.
+    -- Only bail for a GENUINE cast (wasPreview == false). If wasPreview is true,
+    -- the active-cast flags belong to the preview and must be torn down here.
+    if not wasPreview and (HasActiveCast() or holdActive) then return end
+
+    casting, channeling, empowering = nil, nil, nil
+    cachedDuration = nil
+
+    mainFrame:SetScript("OnUpdate", nil)
+    mainFrame.fillBar:SetValue(0)
+    mainFrame.spark:Hide()
+    if ns.Glows then
+        ns.Glows.Stop(mainFrame, GLOW_KEY)
+        StopImportantGlowVisual()
+    end
+    mainFrame:EnableMouse(false)
+    if mainFrame._textFrame  then mainFrame._textFrame:Hide()  end
+    if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
+    if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
+    mainFrame.kickTick:SetAlpha(0)
+    mainFrame:Hide()
+
+    local cfg2 = GetDB()
+    mainFrame:SetFrameStrata(cfg2 and cfg2.barFrameStrata or "MEDIUM")
+    if mainFrame._textFrame then mainFrame._textFrame:SetFrameStrata("HIGH") end
 end
 
 -- ===================================================================
@@ -856,123 +1296,77 @@ eventFrame:SetScript("OnEvent", function(_, event, unit, ...)
         return
     end
 
-    if event == "EDIT_MODE_ENTERED" then
-        -- Only show preview when the ArcUI panel is open, or when the user explicitly
-        -- entered WoW's native Edit Mode (not triggered by LibEQOL drag mode).
-        local nativeEM = EditModeManagerFrame and EditModeManagerFrame:IsShown()
-        if not castActive and not holdActive and (ns._arcUIOptionsOpen or nativeEM) then
-            FC.ShowPreview()
-        end
-        return
-    end
-    if event == "EDIT_MODE_EXITED" then
-        if not castActive and not holdActive and not ns._arcUIOptionsOpen then FC.HidePreview() end
-        return
-    end
-
     if event == "RAID_TARGET_UPDATE" then
-        if castActive then UpdateRaidMarker(false) end
+        if HasActiveCast() then UpdateRaidMarker(false) end
         return
     end
 
     if event == "PLAYER_FOCUS_CHANGED" then
         if ns._arcUIOptionsOpen then
-            -- Keep preview alive; just refresh the raid marker for the new focus
             UpdateRaidMarker(true)
             return
         end
-        castWasInterrupted = false
         CancelHoldTimer()
-        HideCast()
-        local n = UnitCastingInfo("focus")
-        if n then ShowCast(false); return end
-        local cn = UnitChannelInfo("focus")
-        if cn then ShowCast(true); return end
-        -- UnitCastingInfo can return nil right at the moment focus changes; retry briefly.
-        C_Timer.After(0.1, function()
-            if castActive then return end
-            local n2 = UnitCastingInfo("focus")
-            if n2 then ShowCast(false); return end
-            local cn2 = UnitChannelInfo("focus")
-            if cn2 then ShowCast(true) end
-        end)
-        UpdateFocusTargetText()
+        if UnitExists("focus") then
+            StartCast()
+            UpdateRaidMarker(false)
+        else
+            HideCast()
+        end
         return
     end
 
     if event == "PLAYER_ENTERING_WORLD" then
         HideCast()
-        local n = UnitCastingInfo("focus")
-        if n then ShowCast(false); return end
-        local cn = UnitChannelInfo("focus")
-        if cn then ShowCast(true) end
+        if UnitExists("focus") then StartCast() end
         return
     end
 
+    -- Global RegisterEvent delivers unit="focus" for NPC focus targets.
     if unit ~= "focus" then return end
 
-    if event == "UNIT_SPELLCAST_START" then
-        castWasInterrupted = false
-        ShowCast(false)
+    if event == "UNIT_SPELLCAST_START"
+    or event == "UNIT_SPELLCAST_CHANNEL_START"
+    or event == "UNIT_SPELLCAST_EMPOWER_START" then
+        StartCast()
 
-    elseif event == "UNIT_SPELLCAST_CHANNEL_START" then
-        castWasInterrupted = false
-        ShowCast(true)
-
-    elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
-        if castActive then
-            castWasInterrupted = true
-            EndCast("interrupted")
+    elseif event == "UNIT_SPELLCAST_STOP"
+        or event == "UNIT_SPELLCAST_CHANNEL_STOP"
+        or event == "UNIT_SPELLCAST_EMPOWER_STOP" then
+        -- STOP may carry an "interrupted by" GUID on channel/empower variants
+        local interruptedBy
+        if event == "UNIT_SPELLCAST_CHANNEL_STOP" then
+            interruptedBy = select(2, ...)
+        elseif event == "UNIT_SPELLCAST_EMPOWER_STOP" then
+            interruptedBy = select(3, ...)
         end
-
-    elseif event == "UNIT_SPELLCAST_STOP" then
-        -- STOP fires after INTERRUPTED for the same cast — ignore if already handled
-        if castActive and not castWasInterrupted then
+        if interruptedBy then
+            local by = UnitNameFromGUID and UnitNameFromGUID(interruptedBy)
+            EndCast("interrupted", by)
+        else
             EndCast("success")
         end
-        castWasInterrupted = false
+
+    elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
+        local guid = select(2, ...)
+        local by = guid and UnitNameFromGUID and UnitNameFromGUID(guid)
+        EndCast("interrupted", by)
 
     elseif event == "UNIT_SPELLCAST_FAILED" then
-        castWasInterrupted = false
         EndCast("failed")
 
-    elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
-        castWasInterrupted = false
-        EndCast("success")
-
     elseif event == "UNIT_SPELLCAST_DELAYED" then
-        -- Cast pushed back — re-query to get the updated duration object
-        if not castActive or isChannel then return end
-        ShowCast(false)
+        if casting then StartCast() end   -- re-query for updated duration object
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_UPDATE" then
-        -- Haste changed mid-channel — re-query to get the updated duration object
-        if not castActive or not isChannel then return end
-        ShowCast(true)
+        if channeling or empowering then StartCast() end
 
     elseif event == "UNIT_TARGET" then
         UpdateFocusTargetText()
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTIBLE"
         or event == "UNIT_SPELLCAST_NOT_INTERRUPTIBLE" then
-        if not castActive or not mainFrame then return end
-        -- Refresh the stored secret boolean from the appropriate API
-        local newNotInt
-        if isChannel then
-            local _,_,_,_,_,_, ni = UnitChannelInfo("focus")
-            newNotInt = ni
-        else
-            local _,_,_,_,_,_,_, ni = UnitCastingInfo("focus")
-            newNotInt = ni
-        end
-        state_notInterruptible = newNotInt
-        local cfg = GetDB()
-        if cfg then
-            if cfg.hideNotInterruptible then
-                mainFrame:SetAlphaFromBoolean(state_notInterruptible, 0, 1)
-            end
-            UpdateBarColor(cfg, nil)
-        end
+        UpdateInterruptible()
     end
 end)
 
@@ -985,33 +1379,32 @@ function FC.Enable()
     CreateFocusFrames()
     CacheInterruptId()
     FC.ApplyAppearance()
+
     eventFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
     eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
     eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     eventFrame:RegisterEvent("LOADING_SCREEN_DISABLED")
     eventFrame:RegisterEvent("RAID_TARGET_UPDATE")
-    -- Global registration so events fire reliably for the "focus" unit token.
-    -- The handler filters with `if unit ~= "focus" then return end`.
-    -- RegisterUnitEvent("focus") guarantees unit="focus" in the handler for NPC focus targets.
-    -- Global RegisterEvent fires with the mob's internal token (nameplate5, boss1, etc.),
-    -- which our unit~="focus" guard would drop, causing missed STOP/START events.
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_START",             "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_STOP",              "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED",            "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_INTERRUPTED",       "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START",     "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_STOP",      "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_DELAYED",           "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_UPDATE",    "focus")
-    eventFrame:RegisterUnitEvent("UNIT_TARGET",                      "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_INTERRUPTIBLE",     "focus")
-    eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_NOT_INTERRUPTIBLE", "focus")
-    -- Check if the focus is already mid-cast when the feature is first enabled
-    local n = UnitCastingInfo("focus")
-    if n then ShowCast(false); return end
-    local cn = UnitChannelInfo("focus")
-    if cn then ShowCast(true) end
+
+    -- Global registration: RegisterUnitEvent("focus") does not reliably fire for
+    -- NPC focus targets in WoW 12.0; the handler filters on unit == "focus".
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_STOP")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_FAILED")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTED")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_START")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_START")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_EMPOWER_STOP")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_DELAYED")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_UPDATE")
+    eventFrame:RegisterUnitEvent("UNIT_TARGET", "focus")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_INTERRUPTIBLE")
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_NOT_INTERRUPTIBLE")
+
+    -- Catch a focus already mid-cast when first enabled
+    if UnitExists("focus") then StartCast() end
 end
 
 function FC.Disable()
@@ -1019,107 +1412,8 @@ function FC.Disable()
     isEnabled = false
     HideCast()
     eventFrame:UnregisterAllEvents()
-    -- Keep Edit Mode events so the bar still shows for positioning
-    eventFrame:RegisterEvent("EDIT_MODE_ENTERED")
-    eventFrame:RegisterEvent("EDIT_MODE_EXITED")
-end
-
--- ===================================================================
--- PREVIEW  (shown whenever options panel is open or WoW Edit Mode active)
--- ===================================================================
-function FC.ShowPreview()
-    if castActive or holdActive then return end
-    -- Only show the preview when the options panel is open, or in native WoW Edit Mode.
-    -- This is the authoritative gate: nothing should display a preview otherwise.
-    local nativeEM = EditModeManagerFrame and EditModeManagerFrame:IsShown()
-    if not ns._arcUIOptionsOpen and not nativeEM then return end
-    CreateFocusFrames()
-    if not mainFrame then return end
-    local cfg = GetDB()
-    if not cfg or not cfg.enabled then return end
-
-    ApplyAppearanceInternal(cfg)
-    FC.ApplyPosition()
-    RebuildColorObjects(cfg)
-
-    mainFrame:EnableMouse(true)
-    mainFrame:SetAlpha(1)
-
-    -- Only reset animation clock on first entry; keep it running across setting changes
-    if mainFrame:GetScript("OnUpdate") ~= PreviewOnUpdate then
-        castStart = GetTime()
-        mainFrame:SetScript("OnUpdate", PreviewOnUpdate)
-    end
-
-    local bc      = cfg.barColor or {r=1,g=0.65,b=0,a=1}
-    local fillTex = mainFrame.fillBar:GetStatusBarTexture()
-    if fillTex then fillTex:SetVertexColor(bc.r, bc.g, bc.b, bc.a or 1) end
-
-    local textF = mainFrame._textFrame
-    if textF then
-        textF.nameText:SetText(cfg.showSpellName    and "Focus Castbar" or "")
-        textF.casterText:SetText(cfg.showCasterName and "Focus Target"  or "")
-        textF:Show()
-    end
-
-    -- Raid marker: show configured default (moon=8) in preview for positioning
-    if cfg.showRaidMarker then
-        local defIdx = cfg.raidMarkerDefault or 8
-        if defIdx > 0 then
-            ApplyRaidMarkerSettings()
-            ---@diagnostic disable-next-line: undefined-global
-            SetRaidTargetIconTexture(mainFrame._raidMarker, defIdx)
-            mainFrame._raidMarker:Show()
-        else
-            mainFrame._raidMarker:Hide()
-        end
-    end
-
-    -- Focus target placeholder in preview
-    if textF and textF.focusTargetText then
-        if cfg.showFocusTarget then
-            textF.focusTargetText:SetText("Enemy Name")
-            textF.focusTargetText:Show()
-        else
-            textF.focusTargetText:Hide()
-        end
-    end
-
-    -- Always show a glow outline in preview so the bar is easy to see and position
-    if ns.Glows then
-        local gc = cfg.showGlow and cfg.glowColor or {r=1, g=0.65, b=0, a=1}
-        ns.Glows.Start(mainFrame, GLOW_KEY, cfg.glowType or "pixel", {
-            color      = {gc.r, gc.g, gc.b, gc.a or 1},
-            thickness  = cfg.glowWidth     or 2,
-            lines      = cfg.glowLines     or 8,
-            frequency  = cfg.glowFrequency or 0.25,
-            frameLevel = 15,
-        })
-    end
-
-    -- Important spell glow shown in preview if enabled (so user can tune it)
-    UpdateImportantGlow(nil, cfg, cfg.importantGlowEnabled)
-
-    mainFrame.kickTick:SetAlpha(0)
-    if mainFrame._dragHandle then mainFrame._dragHandle:Show() end
-    mainFrame:Show()
-end
-
-function FC.HidePreview()
-    if not mainFrame then return end
-    if castActive or holdActive then return end
-    mainFrame:SetScript("OnUpdate", nil)
-    if ns.Glows then
-        ns.Glows.Stop(mainFrame, GLOW_KEY)
-        ns.Glows.Stop(mainFrame, IMP_GLOW_KEY)
-    end
-    mainFrame:EnableMouse(false)
-    if mainFrame._textFrame  then mainFrame._textFrame:Hide()  end
-    if mainFrame._iconFrame  then mainFrame._iconFrame:Hide()  end
-    if mainFrame._raidMarker then mainFrame._raidMarker:Hide() end
-    if mainFrame._dragHandle then mainFrame._dragHandle:Hide() end
-    mainFrame.kickTick:SetAlpha(0)
-    mainFrame:Hide()
+    -- Edit Mode preview is driven by hooks on EditModeManagerFrame (installed in
+    -- Init), not events, so there is nothing to re-register here.
 end
 
 -- ===================================================================
@@ -1130,9 +1424,20 @@ function FC.Init()
     isInitialized = true
     CreateFocusFrames()
     CacheInterruptId()
-    -- Always listen for Edit Mode so the bar shows for positioning even when disabled
-    eventFrame:RegisterEvent("EDIT_MODE_ENTERED")
-    eventFrame:RegisterEvent("EDIT_MODE_EXITED")
+    -- Show/hide the preview with native Edit Mode too. EDIT_MODE_ENTERED/EXITED
+    -- are NOT real events (RegisterEvent throws on them) — hook the Edit Mode
+    -- manager's enter/exit methods instead (same pattern as EditModeContainers).
+    if EditModeManagerFrame and not FC._editModeHooked then
+        FC._editModeHooked = true
+        hooksecurefunc(EditModeManagerFrame, "EnterEditMode", function()
+            if not HasActiveCast() and not holdActive then FC.ShowPreview() end
+        end)
+        hooksecurefunc(EditModeManagerFrame, "ExitEditMode", function()
+            if not HasActiveCast() and not holdActive and not ns._arcUIOptionsOpen then
+                FC.HidePreview()
+            end
+        end)
+    end
     local cfg = GetDB()
     if cfg and cfg.enabled then FC.Enable() end
     if ns.CDMShared and ns.CDMShared.RegisterPanelCallback then
@@ -1142,34 +1447,4 @@ function FC.Init()
         })
     end
     FC.ApplyAppearance()
-end
-
--- ===================================================================
--- DEBUG SLASH COMMAND  (/arcfcdebug)
--- ===================================================================
-SLASH_ARCFCDEBUG1 = "/arcfcdebug"
-SlashCmdList["ARCFCDEBUG"] = function()
-    local cfg = GetDB()
-    local castName, _, _, sT, eT = UnitCastingInfo("focus")
-    local chanName, _, _, csT, ceT = UnitChannelInfo("focus")
-    local focusName = UnitName("focus") or "none"
-    print("|cff00ff00[ArcFC]|r Debug dump:")
-    print("  cfg.enabled=" .. tostring(cfg and cfg.enabled))
-    print("  events registered (isEnabled)=" .. tostring(isEnabled))
-    print("  isInitialized=" .. tostring(isInitialized))
-    print("  castActive=" .. tostring(castActive))
-    print("  focus unit=" .. focusName)
-    print("  UnitCastingInfo: name=" .. tostring(castName) .. " startMS=" .. tostring(sT) .. " endMS=" .. tostring(eT))
-    print("  UnitChannelInfo: name=" .. tostring(chanName) .. " startMS=" .. tostring(csT) .. " endMS=" .. tostring(ceT))
-    print("  hideNotInterruptible=" .. tostring(cfg and cfg.hideNotInterruptible))
-    print("  ns._arcUIOptionsOpen=" .. tostring(ns._arcUIOptionsOpen))
-    if not (cfg and cfg.enabled) then
-        print("|cffff4444[ArcFC]|r Feature is DISABLED. Enable via /arcui → Castbar → Focus Castbar.")
-    elseif not isEnabled then
-        print("|cffff4444[ArcFC]|r Events not registered. Try /reload.")
-    elseif cfg and cfg.hideNotInterruptible then
-        print("|cffffff00[ArcFC]|r WARNING: hideNotInterruptible=true — bar is invisible for non-interruptible casts.")
-    else
-        print("|cff00ff00[ArcFC]|r Feature is enabled and events are registered.")
-    end
 end

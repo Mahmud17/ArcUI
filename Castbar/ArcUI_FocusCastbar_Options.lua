@@ -23,8 +23,19 @@ local collapsed = {
   position     = true,
 }
 
+local ANCHOR_POINTS = {
+  TOPLEFT="Top Left", TOP="Top", TOPRIGHT="Top Right",
+  LEFT="Left", CENTER="Center", RIGHT="Right",
+  BOTTOMLEFT="Bottom Left", BOTTOM="Bottom", BOTTOMRIGHT="Bottom Right",
+}
+
 local function GetDB()
   return ns.db and ns.db.char and ns.db.char.focusCastbar
+end
+
+-- True when the bar is pinned to another frame (free-position controls hide).
+local function AnchoredOn()
+  local c = GetDB(); return c and c.anchorToFrame
 end
 
 local function Refresh()
@@ -435,6 +446,18 @@ function ns.FocusCastbarOptions.GetOptionsTable()
     get = function() local c = GetDB(); return c and c.showCasterName end,
     set = function(_, v) local c = GetDB(); if c then c.showCasterName = v; Refresh() end end,
   }
+  a.fcCasterNameColor = {
+    type = "color", name = "Caster Name Color", order = 60.32, width = 1.2, hasAlpha = true,
+    desc = "Color of the caster (focus target) name shown below the bar.",
+    hidden = H("content", function() local c = GetDB(); return not (c and c.showCasterName) end),
+    get = function()
+      local c = GetDB(); local col = c and c.casterNameColor or {r=1,g=0.82,b=0,a=1}
+      return col.r, col.g, col.b, col.a or 1
+    end,
+    set = function(_, r, g, b, a)
+      local c = GetDB(); if c then c.casterNameColor = {r=r,g=g,b=b,a=a}; Refresh() end
+    end,
+  }
   a.fcCasterNameAnchor = {
     type = "select", name = "Caster Name Align", order = 60.34, width = 1.1,
     desc = "Which edge of the bar the caster name is anchored to.",
@@ -463,6 +486,18 @@ function ns.FocusCastbarOptions.GetOptionsTable()
     hidden = H("content"),
     get = function() local c = GetDB(); return c and c.showFocusTarget end,
     set = function(_, v) local c = GetDB(); if c then c.showFocusTarget = v; Refresh() end end,
+  }
+  a.fcFocusTargetColor = {
+    type = "color", name = "Focus Target Color", order = 60.403, width = 1.2, hasAlpha = true,
+    desc = "Color of the enemy-name text (who the focus is targeting) shown below the bar.",
+    hidden = H("content", function() local c = GetDB(); return not (c and c.showFocusTarget) end),
+    get = function()
+      local c = GetDB(); local col = c and c.focusTargetColor or {r=0.6,g=0.8,b=1,a=1}
+      return col.r, col.g, col.b, col.a or 1
+    end,
+    set = function(_, r, g, b, a)
+      local c = GetDB(); if c then c.focusTargetColor = {r=r,g=g,b=b,a=a}; Refresh() end
+    end,
   }
   a.fcFocusTargetAnchor = {
     type = "select", name = "Focus Target Align", order = 60.405, width = 1.1,
@@ -578,15 +613,81 @@ function ns.FocusCastbarOptions.GetOptionsTable()
     type = "description", order = 90.05, hidden = H("position"),
     name = "|cff888888Drag the castbar (or use the handle icon) while this panel is open, or set X/Y below. After changing the anchor point, drag to reposition.|r",
   }
+  -- ── Anchor to another frame ────────────────────────────────────
+  a.fcAnchorSep = {
+    type = "description", name = "|cff888888— Anchor to Another Frame —|r",
+    order = 90.06, hidden = H("position"),
+  }
+  a.fcAnchorToFrame = {
+    type = "toggle", name = "Anchor to Frame", order = 90.061, width = 1.5,
+    desc = "Pin the castbar to another UI frame instead of a fixed screen position. When on, use the point and offset controls below; dragging is disabled.",
+    hidden = H("position"),
+    get = function() local c = GetDB(); return c and c.anchorToFrame end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorToFrame = v; Refresh() end end,
+  }
+  a.fcAnchorFrameName = {
+    type = "input", name = "Anchor Frame Name", order = 90.062, width = 1.8,
+    desc = "Global name of the frame to anchor to (e.g. PlayerFrame, TargetFrame, FocusFrame). If the frame isn't found, the castbar falls back to its normal position.",
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorFrameName or "" end,
+    set = function(_, v)
+      local c = GetDB(); if not c then return end
+      c.anchorFrameName = (type(v) == "string" and v:trim()) or ""
+      Refresh()
+    end,
+  }
+  a.fcAnchorCommon = {
+    type = "select", name = "Common Frames", order = 90.063, width = 1.2,
+    desc = "Quick-pick a common frame to fill the name above.",
+    values = {
+      PlayerFrame="Player Frame", TargetFrame="Target Frame",
+      FocusFrame="Focus Frame", PetFrame="Pet Frame",
+      EssentialCooldownViewer="CDM: Essential", UtilityCooldownViewer="CDM: Utility",
+      BuffIconCooldownViewer="CDM: Buff Icons", BuffBarCooldownViewer="CDM: Buff Bars",
+    },
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorFrameName end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorFrameName = v; Refresh() end end,
+  }
+  a.fcAnchorPoint = {
+    type = "select", name = "Castbar Point", order = 90.064, width = 1.2,
+    desc = "Which point of the castbar attaches to the target frame.",
+    values = ANCHOR_POINTS,
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorPoint or "CENTER" end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorPoint = v; Refresh() end end,
+  }
+  a.fcAnchorRelPoint = {
+    type = "select", name = "Target Frame Point", order = 90.065, width = 1.4,
+    desc = "Which point of the target frame the castbar attaches to.",
+    values = ANCHOR_POINTS,
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorRelativePoint or "CENTER" end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorRelativePoint = v; Refresh() end end,
+  }
+  a.fcAnchorOffsetX = {
+    type = "range", name = "Anchor Offset X", order = 90.066, width = 1.2,
+    min = -600, max = 600, step = 1,
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorOffsetX or 0 end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorOffsetX = v; Refresh() end end,
+  }
+  a.fcAnchorOffsetY = {
+    type = "range", name = "Anchor Offset Y", order = 90.067, width = 1.2,
+    min = -600, max = 600, step = 1,
+    hidden = H("position", function() return not AnchoredOn() end),
+    get = function() local c = GetDB(); return c and c.anchorOffsetY or 0 end,
+    set = function(_, v) local c = GetDB(); if c then c.anchorOffsetY = v; Refresh() end end,
+  }
+  a.fcFreeSep = {
+    type = "description", name = "|cff888888— Free Position —|r",
+    order = 90.07, hidden = H("position", AnchoredOn),
+  }
   a.fcBarAnchorPoint = {
     type = "select", name = "Bar Anchor Point", order = 90.08, width = 1.3,
     desc = "Which point of the castbar frame is pinned to the screen. Drag to reposition after changing.",
-    values = {
-      TOPLEFT="Top Left", TOP="Top", TOPRIGHT="Top Right",
-      LEFT="Left", CENTER="Center", RIGHT="Right",
-      BOTTOMLEFT="Bottom Left", BOTTOM="Bottom", BOTTOMRIGHT="Bottom Right",
-    },
-    hidden = H("position"),
+    values = ANCHOR_POINTS,
+    hidden = H("position", AnchoredOn),
     get = function() local c = GetDB(); return c and c.barAnchorPoint or "CENTER" end,
     set = function(_, v)
       local c = GetDB(); if not c then return end
@@ -598,7 +699,7 @@ function ns.FocusCastbarOptions.GetOptionsTable()
   }
   a.fcPosX = {
     type = "range", name = "Position X", order = 90.1,
-    min = -2000, max = 2000, step = 1, hidden = H("position"),
+    min = -2000, max = 2000, step = 1, hidden = H("position", AnchoredOn),
     get = function() local c = GetDB(); return (c and c.barPosition and c.barPosition.x) or 0 end,
     set = function(_, v)
       local c = GetDB(); if not c then return end
@@ -608,7 +709,7 @@ function ns.FocusCastbarOptions.GetOptionsTable()
   }
   a.fcPosY = {
     type = "range", name = "Position Y", order = 90.2,
-    min = -2000, max = 2000, step = 1, hidden = H("position"),
+    min = -2000, max = 2000, step = 1, hidden = H("position", AnchoredOn),
     get = function() local c = GetDB(); return (c and c.barPosition and c.barPosition.y) or -120 end,
     set = function(_, v)
       local c = GetDB(); if not c then return end
@@ -618,7 +719,7 @@ function ns.FocusCastbarOptions.GetOptionsTable()
   }
   a.fcResetPos = {
     type = "execute", name = "Reset Position", order = 90.3, width = 1.0,
-    hidden = H("position"),
+    hidden = H("position", AnchoredOn),
     func = function()
       local c = GetDB(); if not c then return end
       c.barPosition = {point="CENTER",relPoint="CENTER",x=0,y=-120}; Refresh()
