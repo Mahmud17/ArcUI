@@ -10,6 +10,27 @@ ns.Options = ns.Options or {}
 local AceConfig = LibStub("AceConfig-3.0")
 local AceConfigDialog = LibStub("AceConfigDialog-3.0")
 local AceDB = LibStub("AceDB-3.0")
+local LSM = LibStub("LibSharedMedia-3.0", true)
+
+local function GetGlobalFontValues()
+  local fonts = { ["Friz Quadrata TT"] = "Friz Quadrata TT" }
+  if LSM then
+    for _, name in pairs(LSM:List("font")) do
+      fonts[name] = name
+    end
+  end
+  return fonts
+end
+
+local function GetGlobalStatusBarTextureValues()
+  local textures = { ["Blizzard"] = "Blizzard", ["Smooth"] = "Smooth" }
+  if LSM then
+    for _, name in pairs(LSM:List("statusbar")) do
+      textures[name] = name
+    end
+  end
+  return textures
+end
 
 -- Profile browser collapsed state (defaults closed)
 local profileBrowserCollapsed = true
@@ -843,6 +864,67 @@ local function GetOptionsTable()
             end,
           },
           
+          fontTextureHeader = {
+            type = "header",
+            name = "Global Font & Texture",
+            order = 3,
+          },
+          fontTextureDesc = {
+            type = "description",
+            name = "|cffaaaaaaPick a font and statusbar texture once, then push them onto everything: every aura, resource, cooldown, and timer bar, both castbars, and every CDM icon group's cooldown/stack text, custom labels, and keybind text -- no need to set it in each group individually. This updates everything in place; anything can still be customized afterward.|r",
+            order = 4,
+            fontSize = "medium",
+          },
+          globalFont = {
+            type = "select",
+            dialogControl = "LSM30_Font",
+            name = "Font",
+            order = 5,
+            width = 1.2,
+            values = GetGlobalFontValues,
+            get = function()
+              local g = ns.API.GetGlobalDB and ns.API.GetGlobalDB()
+              return g and g.globalFont or "Friz Quadrata TT"
+            end,
+            set = function(_, val)
+              local g = ns.API.GetGlobalDB and ns.API.GetGlobalDB()
+              if g then g.globalFont = val end
+            end,
+          },
+          globalBarTexture = {
+            type = "select",
+            dialogControl = "LSM30_Statusbar",
+            name = "Statusbar Texture",
+            order = 6,
+            width = 1.2,
+            values = GetGlobalStatusBarTextureValues,
+            get = function()
+              local g = ns.API.GetGlobalDB and ns.API.GetGlobalDB()
+              return g and g.globalBarTexture or "Blizzard"
+            end,
+            set = function(_, val)
+              local g = ns.API.GetGlobalDB and ns.API.GetGlobalDB()
+              if g then g.globalBarTexture = val end
+            end,
+          },
+          globalFontTextureApply = {
+            type = "execute",
+            name = "Apply to All Bars",
+            desc = "Push the font and texture above onto every existing aura, resource, cooldown, and timer bar, the player and focus castbars, and the font onto every CDM icon group's cooldown/stack text, custom labels, and keybind text.",
+            order = 7,
+            width = 1.5,
+            confirm = true,
+            confirmText = "This will overwrite the font and statusbar texture on every bar, castbar, and icon group you have configured. Continue?",
+            func = function()
+              local g = ns.API.GetGlobalDB and ns.API.GetGlobalDB()
+              local font = g and g.globalFont or "Friz Quadrata TT"
+              local texture = g and g.globalBarTexture or "Blizzard"
+              if ns.API.ApplyGlobalFontTexture then
+                ns.API.ApplyGlobalFontTexture(font, texture)
+              end
+            end,
+          },
+
           minimapHeader = {
             type = "header",
             name = "Minimap",
